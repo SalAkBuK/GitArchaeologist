@@ -1,0 +1,604 @@
+{
+  "sourceTypes": {
+    "slack_message": {
+      "label": "Slack",
+      "tone": "violet"
+    },
+    "jira_ticket": {
+      "label": "Jira",
+      "tone": "cyan"
+    },
+    "github_pull_request": {
+      "label": "Pull Request",
+      "tone": "green"
+    },
+    "git_commit": {
+      "label": "Commit",
+      "tone": "neutral"
+    },
+    "service": {
+      "label": "Service",
+      "tone": "amber"
+    }
+  },
+  "repositories": [
+    {
+      "id": "repo_acme_platform",
+      "name": "acme-platform"
+    }
+  ],
+  "integrations": [
+    {
+      "id": "integration_github",
+      "name": "GitHub",
+      "provider": "github",
+      "status": "Connected"
+    },
+    {
+      "id": "integration_jira",
+      "name": "Jira",
+      "provider": "jira",
+      "status": "Connected"
+    },
+    {
+      "id": "integration_slack",
+      "name": "Slack",
+      "provider": "slack",
+      "status": "Connected"
+    }
+  ],
+  "exampleQueries": [
+    {
+      "id": "example_redis",
+      "question": "Why was Redis introduced?"
+    },
+    {
+      "id": "example_db_migration",
+      "question": "Who approved the database migration?"
+    },
+    {
+      "id": "example_retry",
+      "question": "What caused the retry mechanism to be added?"
+    }
+  ],
+  "investigation": {
+    "id": "inv_001",
+    "displayId": "#128",
+    "repositoryId": "repo_acme_platform",
+    "repositoryName": "acme-platform",
+    "query": "Why was Redis added?",
+    "status": "completed",
+    "rootCauseSummary": "Redis was introduced to mitigate severe API latency caused by profile lookup bottlenecks under peak traffic.",
+    "confidenceScore": 92,
+    "confidenceLevel": "high",
+    "intentAlignmentScore": 92,
+    "evidenceNodeCount": 4,
+    "correlationSignals": [
+      "Semantic Match",
+      "Temporal Match",
+      "Shared Ownership",
+      "Ticket Reference",
+      "Component Correlation"
+    ],
+    "reasoningChain": [
+      {
+        "id": "reason_001",
+        "order": 1,
+        "text": "Engineers reported production API timeouts.",
+        "artifactIds": [
+          "artifact_slack_timeout_report"
+        ],
+        "edgeIds": []
+      },
+      {
+        "id": "reason_002",
+        "order": 2,
+        "text": "Slack discussion proposed Redis as a caching layer.",
+        "artifactIds": [
+          "artifact_slack_redis_reply"
+        ],
+        "edgeIds": [
+          "edge_slack_report_to_reply"
+        ]
+      },
+      {
+        "id": "reason_003",
+        "order": 3,
+        "text": "JIRA-43 was created to address profile lookup bottlenecks.",
+        "artifactIds": [
+          "artifact_jira_43"
+        ],
+        "edgeIds": [
+          "edge_slack_reply_to_jira"
+        ]
+      },
+      {
+        "id": "reason_004",
+        "order": 4,
+        "text": "Pull Request opened implementing Redis cache.",
+        "artifactIds": [
+          "artifact_pr_182"
+        ],
+        "edgeIds": [
+          "edge_jira_to_pr"
+        ]
+      },
+      {
+        "id": "reason_005",
+        "order": 5,
+        "text": "Commit x782f deployed the solution.",
+        "artifactIds": [
+          "artifact_commit_x782f"
+        ],
+        "edgeIds": [
+          "edge_pr_to_commit",
+          "edge_commit_to_service"
+        ]
+      }
+    ],
+    "hypotheses": [
+      {
+        "id": "hypothesis_primary",
+        "label": "Primary Hypothesis",
+        "confidence": 92,
+        "text": "Redis added to reduce API latency",
+        "primary": true,
+        "supportingArtifactIds": [
+          "artifact_slack_timeout_report",
+          "artifact_slack_redis_reply",
+          "artifact_jira_43",
+          "artifact_pr_182",
+          "artifact_commit_x782f"
+        ],
+        "contradictingArtifactIds": []
+      },
+      {
+        "id": "hypothesis_secondary",
+        "label": "Secondary Hypothesis",
+        "confidence": 18,
+        "text": "Redis added to improve session persistence",
+        "primary": false,
+        "supportingArtifactIds": [],
+        "contradictingArtifactIds": [
+          "artifact_jira_43",
+          "artifact_commit_x782f"
+        ]
+      }
+    ],
+    "metrics": [
+      {
+        "id": "commits_indexed",
+        "label": "Commits Indexed",
+        "value": "2,481",
+        "scope": "repository"
+      },
+      {
+        "id": "conversations_analyzed",
+        "label": "Conversations Analyzed",
+        "value": "312",
+        "scope": "repository"
+      },
+      {
+        "id": "tickets_linked",
+        "label": "Tickets Linked",
+        "value": "74",
+        "scope": "repository"
+      },
+      {
+        "id": "graph_confidence",
+        "label": "Graph Confidence",
+        "value": "91%",
+        "scope": "investigation"
+      },
+      {
+        "id": "time_to_insight",
+        "label": "Time To Insight",
+        "value": "5.2s",
+        "scope": "investigation"
+      }
+    ],
+    "createdBy": {
+      "id": "user_sarah_jensen",
+      "displayName": "Sarah Jensen",
+      "email": "sarah.jensen@example.com",
+      "provider": "local"
+    },
+    "createdAt": "2024-03-21T18:40:00Z",
+    "updatedAt": "2024-03-21T18:40:00Z",
+    "completedAt": "2024-03-21T18:40:00Z"
+  },
+  "artifacts": [
+    {
+      "id": "artifact_slack_timeout_report",
+      "investigationId": "inv_001",
+      "repositoryId": "repo_acme_platform",
+      "sourceType": "slack_message",
+      "externalId": "slack_backend_infra_20240318_0942",
+      "sourceUrl": "https://slack.example.com/archives/backend-infra/p1710754920",
+      "title": "Slack Discussion",
+      "summary": "Reports severe API timeouts caused by session lookups hammering PostgreSQL.",
+      "body": "Reports severe API timeouts caused by session lookups hammering PostgreSQL.",
+      "detail": "p99 latency crossed 1.8s during the 9am traffic spike. Profile resolution queries account for 63% of DB load. Flagged #backend-infra for urgent triage.",
+      "author": {
+        "id": "user_alex_chen",
+        "displayName": "Alex Chen",
+        "provider": "slack"
+      },
+      "occurredAt": "2024-03-18T09:42:00Z",
+      "ingestedAt": "2024-03-21T18:20:00Z",
+      "confidence": 88,
+      "confidenceLevel": "high",
+      "tags": [
+        "latency",
+        "postgres",
+        "profile-service"
+      ],
+      "metadata": {
+        "channel": "backend-infra"
+      }
+    },
+    {
+      "id": "artifact_slack_redis_reply",
+      "investigationId": "inv_001",
+      "repositoryId": "repo_acme_platform",
+      "sourceType": "slack_message",
+      "externalId": "slack_backend_infra_20240318_1011",
+      "sourceUrl": "https://slack.example.com/archives/backend-infra/p1710756660",
+      "title": "Slack Reply",
+      "summary": "Proposes Redis as a caching layer to protect p99 latency targets.",
+      "body": "Proposes Redis as a caching layer to protect p99 latency targets.",
+      "detail": "Suggests a read-through cache keyed on user id with a 60s TTL. Estimates a 70% reduction in profile-lookup DB hits based on access patterns.",
+      "author": {
+        "id": "user_sarah_jensen",
+        "displayName": "Sarah Jensen",
+        "provider": "slack"
+      },
+      "occurredAt": "2024-03-18T10:11:00Z",
+      "ingestedAt": "2024-03-21T18:21:00Z",
+      "confidence": 84,
+      "confidenceLevel": "high",
+      "tags": [
+        "redis",
+        "cache",
+        "latency"
+      ],
+      "metadata": {
+        "channel": "backend-infra"
+      }
+    },
+    {
+      "id": "artifact_jira_43",
+      "investigationId": "inv_001",
+      "repositoryId": "repo_acme_platform",
+      "sourceType": "jira_ticket",
+      "externalId": "JIRA-43",
+      "sourceUrl": "https://jira.example.com/browse/JIRA-43",
+      "title": "JIRA-43",
+      "summary": "Production API Bottleneck Under Peak Traffic Load.",
+      "body": "Production API Bottleneck Under Peak Traffic Load.",
+      "detail": "Priority: Critical. Acceptance criteria: p99 profile resolution under 200ms at peak. Linked to #backend-infra thread and PR #182.",
+      "author": {
+        "id": "user_sarah_jensen",
+        "displayName": "Sarah Jensen",
+        "provider": "jira"
+      },
+      "occurredAt": "2024-03-18T14:10:00Z",
+      "ingestedAt": "2024-03-21T18:22:00Z",
+      "confidence": 90,
+      "confidenceLevel": "high",
+      "tags": [
+        "jira",
+        "critical",
+        "profile-service"
+      ],
+      "metadata": {
+        "priority": "Critical",
+        "status": "Done"
+      }
+    },
+    {
+      "id": "artifact_pr_182",
+      "investigationId": "inv_001",
+      "repositoryId": "repo_acme_platform",
+      "sourceType": "github_pull_request",
+      "externalId": "182",
+      "sourceUrl": "https://github.example.com/acme/acme-platform/pull/182",
+      "title": "Pull Request #182",
+      "summary": "Implement Redis Cache Layer.",
+      "body": "Implement Redis Cache Layer.",
+      "detail": "Adds a read-through cache in the profile service, 60s TTL, cache invalidation on profile mutation. Approved by Devin Park. 2 reviewers, 1 approval.",
+      "author": {
+        "id": "user_sarah_jensen",
+        "displayName": "Sarah Jensen",
+        "provider": "github"
+      },
+      "occurredAt": "2024-03-20T11:27:00Z",
+      "ingestedAt": "2024-03-21T18:23:00Z",
+      "confidence": 94,
+      "confidenceLevel": "high",
+      "tags": [
+        "github",
+        "redis",
+        "profile-service"
+      ],
+      "metadata": {
+        "reviewers": 2,
+        "approvals": 1
+      }
+    },
+    {
+      "id": "artifact_commit_x782f",
+      "investigationId": "inv_001",
+      "repositoryId": "repo_acme_platform",
+      "sourceType": "git_commit",
+      "externalId": "x782f",
+      "sourceUrl": "https://github.example.com/acme/acme-platform/commit/x782f",
+      "title": "Commit x782f",
+      "summary": "Feat: Implement Redis caching layer for primary user profile resolution paths.",
+      "body": "Feat: Implement Redis caching layer for primary user profile resolution paths.",
+      "detail": "Deployed to production 18:40 UTC. Post-deploy p99 dropped from 1.8s to 140ms. DB read load reduced 68%. Closes JIRA-43.",
+      "author": {
+        "id": "user_devin_park",
+        "displayName": "Devin Park",
+        "provider": "git"
+      },
+      "occurredAt": "2024-03-21T16:03:00Z",
+      "ingestedAt": "2024-03-21T18:24:00Z",
+      "confidence": 96,
+      "confidenceLevel": "high",
+      "tags": [
+        "commit",
+        "redis",
+        "deployment"
+      ],
+      "metadata": {
+        "closes": "JIRA-43"
+      }
+    },
+    {
+      "id": "artifact_redis_service",
+      "investigationId": "inv_001",
+      "repositoryId": "repo_acme_platform",
+      "sourceType": "service",
+      "externalId": "redis_cache_layer",
+      "sourceUrl": "https://services.example.com/acme-platform/redis-cache-layer",
+      "title": "Redis Cache Layer",
+      "summary": "Runtime service artifact representing the deployed Redis cache layer.",
+      "body": "Runtime service artifact representing the deployed Redis cache layer.",
+      "detail": "Represents the production Redis cache layer introduced for profile resolution.",
+      "author": {
+        "id": "repo_acme_platform",
+        "displayName": "acme-platform",
+        "provider": "service-catalog"
+      },
+      "occurredAt": "2024-03-21T18:40:00Z",
+      "ingestedAt": "2024-03-21T18:25:00Z",
+      "confidence": 92,
+      "confidenceLevel": "high",
+      "tags": [
+        "redis",
+        "service",
+        "cache"
+      ],
+      "metadata": {
+        "component": "profile-service"
+      }
+    }
+  ],
+  "evidenceGraph": {
+    "investigationId": "inv_001",
+    "nodes": [
+      {
+        "id": "node_slack",
+        "artifactId": "artifact_slack_timeout_report",
+        "sourceType": "slack_message",
+        "title": "Slack Discussion",
+        "author": {
+          "id": "user_alex_chen",
+          "displayName": "Alex Chen",
+          "provider": "slack"
+        },
+        "occurredAt": "2024-03-18T09:42:00Z",
+        "confidence": 88,
+        "x": 92,
+        "y": 44
+      },
+      {
+        "id": "node_jira",
+        "artifactId": "artifact_jira_43",
+        "sourceType": "jira_ticket",
+        "title": "JIRA-43",
+        "author": {
+          "id": "user_sarah_jensen",
+          "displayName": "Sarah Jensen",
+          "provider": "jira"
+        },
+        "occurredAt": "2024-03-18T14:10:00Z",
+        "confidence": 90,
+        "x": 300,
+        "y": 156
+      },
+      {
+        "id": "node_pr",
+        "artifactId": "artifact_pr_182",
+        "sourceType": "github_pull_request",
+        "title": "PR #182",
+        "author": {
+          "id": "user_sarah_jensen",
+          "displayName": "Sarah Jensen",
+          "provider": "github"
+        },
+        "occurredAt": "2024-03-20T11:27:00Z",
+        "confidence": 94,
+        "x": 108,
+        "y": 280
+      },
+      {
+        "id": "node_commit",
+        "artifactId": "artifact_commit_x782f",
+        "sourceType": "git_commit",
+        "title": "Commit x782f",
+        "author": {
+          "id": "user_devin_park",
+          "displayName": "Devin Park",
+          "provider": "git"
+        },
+        "occurredAt": "2024-03-21T16:03:00Z",
+        "confidence": 96,
+        "x": 306,
+        "y": 404
+      },
+      {
+        "id": "node_redis",
+        "artifactId": "artifact_redis_service",
+        "sourceType": "service",
+        "title": "Redis Cache Layer",
+        "author": {
+          "id": "repo_acme_platform",
+          "displayName": "acme-platform",
+          "provider": "service-catalog"
+        },
+        "occurredAt": "2024-03-21T18:40:00Z",
+        "confidence": 92,
+        "x": 190,
+        "y": 516
+      }
+    ],
+    "edges": [
+      {
+        "id": "edge_slack_report_to_reply",
+        "investigationId": "inv_001",
+        "fromArtifactId": "artifact_slack_timeout_report",
+        "toArtifactId": "artifact_slack_redis_reply",
+        "relationType": "discusses",
+        "label": "Redis proposed in incident thread",
+        "explanation": "The Redis proposal appears as a direct response to the production timeout report.",
+        "confidence": 84,
+        "signalTypes": [
+          "temporal",
+          "conversation_thread"
+        ],
+        "createdAt": "2024-03-21T18:30:00Z"
+      },
+      {
+        "id": "edge_slack_reply_to_jira",
+        "investigationId": "inv_001",
+        "fromArtifactId": "artifact_slack_redis_reply",
+        "toArtifactId": "artifact_jira_43",
+        "relationType": "references",
+        "label": "Ticket created from Slack triage",
+        "explanation": "JIRA-43 tracks the profile lookup bottleneck discussed in Slack.",
+        "confidence": 90,
+        "signalTypes": [
+          "semantic",
+          "temporal",
+          "shared_actor"
+        ],
+        "createdAt": "2024-03-21T18:31:00Z"
+      },
+      {
+        "id": "edge_jira_to_pr",
+        "investigationId": "inv_001",
+        "fromArtifactId": "artifact_jira_43",
+        "toArtifactId": "artifact_pr_182",
+        "relationType": "implements",
+        "label": "PR implements JIRA-43",
+        "explanation": "The pull request implements the cache layer required by the critical ticket.",
+        "confidence": 94,
+        "signalTypes": [
+          "ticket_reference",
+          "semantic"
+        ],
+        "createdAt": "2024-03-21T18:32:00Z"
+      },
+      {
+        "id": "edge_pr_to_commit",
+        "investigationId": "inv_001",
+        "fromArtifactId": "artifact_pr_182",
+        "toArtifactId": "artifact_commit_x782f",
+        "relationType": "deploys",
+        "label": "Commit lands Redis implementation",
+        "explanation": "Commit x782f contains the merged Redis caching implementation from PR #182.",
+        "confidence": 96,
+        "signalTypes": [
+          "git_history",
+          "pull_request_merge"
+        ],
+        "createdAt": "2024-03-21T18:33:00Z"
+      },
+      {
+        "id": "edge_commit_to_service",
+        "investigationId": "inv_001",
+        "fromArtifactId": "artifact_commit_x782f",
+        "toArtifactId": "artifact_redis_service",
+        "relationType": "causes",
+        "label": "Redis cache layer deployed",
+        "explanation": "The commit resulted in a deployed Redis cache layer for profile resolution.",
+        "confidence": 92,
+        "signalTypes": [
+          "deployment",
+          "component_correlation"
+        ],
+        "createdAt": "2024-03-21T18:34:00Z"
+      }
+    ],
+    "layout": {
+      "algorithm": "manual",
+      "width": 400,
+      "height": 560,
+      "generatedAt": "2024-03-21T18:34:00Z"
+    },
+    "generatedAt": "2024-03-21T18:34:00Z"
+  },
+  "followUpQuestions": [
+    {
+      "id": "followup_p99_before",
+      "investigationId": "inv_001",
+      "question": "What was the p99 latency before Redis?",
+      "rationale": "Quantifies the performance problem that motivated the change.",
+      "priority": 1,
+      "status": "suggested",
+      "generatedFromArtifactIds": [
+        "artifact_slack_timeout_report",
+        "artifact_commit_x782f"
+      ],
+      "generatedFromEdgeIds": [
+        "edge_commit_to_service"
+      ],
+      "createdAt": "2024-03-21T18:35:00Z"
+    },
+    {
+      "id": "followup_q1_infra",
+      "investigationId": "inv_001",
+      "question": "Show related infra decisions in Q1",
+      "rationale": "Finds whether Redis was part of a broader infrastructure pattern.",
+      "priority": 2,
+      "status": "suggested",
+      "generatedFromArtifactIds": [
+        "artifact_pr_182",
+        "artifact_commit_x782f"
+      ],
+      "generatedFromEdgeIds": [
+        "edge_jira_to_pr",
+        "edge_pr_to_commit"
+      ],
+      "createdAt": "2024-03-21T18:35:00Z"
+    },
+    {
+      "id": "followup_profile_owner",
+      "investigationId": "inv_001",
+      "question": "Who owns the profile service now?",
+      "rationale": "Ownership may have changed after the incident response.",
+      "priority": 3,
+      "status": "suggested",
+      "generatedFromArtifactIds": [
+        "artifact_jira_43",
+        "artifact_pr_182"
+      ],
+      "generatedFromEdgeIds": [
+        "edge_jira_to_pr"
+      ],
+      "createdAt": "2024-03-21T18:35:00Z"
+    }
+  ]
+}
