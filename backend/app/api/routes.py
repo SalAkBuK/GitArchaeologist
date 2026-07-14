@@ -8,8 +8,10 @@ from sqlalchemy.orm import Session
 
 from app.database.session import get_db
 from app.repositories.artifacts import ArtifactRepository
+from app.parsers.git_log import FULL_HASH_RE
 from app.schemas.artifact import ArtifactRead
 from app.schemas.ingestion import IngestionResult
+from app.schemas.investigation import CommitInvestigationRead
 from app.services.git_ingestion import GitIngestionService
 
 
@@ -80,7 +82,7 @@ def list_artifacts(
         Query(alias="repositoryId", min_length=1, max_length=255),
     ] = None,
     source_type: Annotated[
-        Literal["git_commit"] | None,
+        Literal["git_commit", "modified_file"] | None,
         Query(alias="sourceType"),
     ] = None,
 ) -> list[ArtifactRead]:
@@ -88,3 +90,35 @@ def list_artifacts(
         repository_id=repository_id,
         source_type=source_type,
     )
+
+
+@router.get(
+    "/api/investigations/commits/{commit_sha}",
+    response_model=CommitInvestigationRead,
+    response_model_by_alias=True,
+)
+def investigate_commit(
+    commit_sha: str,
+    session: Annotated[Session, Depends(get_db)],
+    repository_id: Annotated[
+        str,
+        Query(alias="repositoryId", min_length=1, max_length=255),
+    ],
+) -> CommitInvestigationRead:
+    normalized_commit_sha = commit_sha.strip().lower()
+    if not FULL_HASH_RE.fullmatch(normalized_commit_sha):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="A full 40- or 64-character commit SHA is required",
+        )
+
+    investigation = ArtifactRepository(session).build_commit_investigation(
+        repository_id=repository_id.strip(),
+        commit_sha=normalized_commit_sha,
+    )
+    if investigation is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Commit artifact not found",
+        )
+    return investigation

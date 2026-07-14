@@ -2,13 +2,13 @@
 
 ## Current State
 
-This project is currently a static Next.js UI mockup. The rendered investigation is not backed by API calls, persisted state, ingestion jobs, repository indexing, or a real evidence graph. Most domain data lives in `lib/investigation-data.ts`, while a few important values are embedded directly in components.
+This project now has one live vertical slice backed by FastAPI: Git-log upload, persisted commit and modified-file artifacts, a commit investigation endpoint, and a Next.js dashboard that loads real backend data. The preserved design fixture lives in `sample-data/investigation-001.json`.
 
-The immediate goal should be to preserve the current UI while replacing static structures with typed data contracts and API-backed loading states.
+The immediate goal is still narrow: keep the live commit investigation honest while adding missing deterministic evidence sources one at a time.
 
 ## Hardcoded Data Structures Currently Rendered
 
-### `lib/investigation-data.ts`
+### `sample-data/investigation-001.json`
 
 | Structure | Current role | Should become |
 | --- | --- | --- |
@@ -309,7 +309,7 @@ export interface FollowUpQuestion {
 2. Keep `backend/` empty except for future service scaffolding.
 3. Move current mock data into `sample-data/investigation-128.json`.
 4. Add shared TypeScript domain types in the frontend first.
-5. Replace direct imports from `lib/investigation-data.ts` with a thin data adapter that reads the sample JSON.
+5. Keep design-fixture loading isolated in `lib/investigation-adapter.ts`; live commit investigations should use the backend API instead.
 
 This phase should produce the same UI, but the UI should consume data shaped like the future API.
 

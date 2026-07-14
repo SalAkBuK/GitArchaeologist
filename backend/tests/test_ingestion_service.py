@@ -39,3 +39,26 @@ def test_duplicate_import_prevention_and_summary_counts(database_url: str) -> No
         assert session.query(ArtifactModel).count() == 1
 
     database.dispose()
+
+
+def test_duplicate_import_prevention_includes_modified_files(database_url: str) -> None:
+    database = Database(database_url)
+    database.create_schema()
+
+    with database.session_factory() as session:
+        first = GitIngestionService(session).ingest(
+            "acme/platform",
+            commit_record(HASH_ONE, files=["A\tbackend/app/cache.py"]),
+        )
+        second = GitIngestionService(session).ingest(
+            "acme/platform",
+            commit_record(HASH_ONE, files=["A\tbackend/app/cache.py"]),
+        )
+
+        assert first.records_inserted == 2
+        assert first.records_skipped_as_duplicates == 0
+        assert second.records_inserted == 0
+        assert second.records_skipped_as_duplicates == 2
+        assert session.query(ArtifactModel).count() == 2
+
+    database.dispose()

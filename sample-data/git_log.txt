@@ -6,6 +6,9 @@ Date: 2026-06-01T09:15:00+00:00
 
     Cache normalized repository summary responses in Redis for five minutes.
 
+A	backend/app/cache.py
+M	backend/app/repositories/artifacts.py
+
 commit 2222222222222222222222222222222222222222
 Author: Omar Siddiqui <omar.siddiqui@example.com>
 Date: 2026-06-02T14:30:00+05:00
@@ -13,6 +16,8 @@ Date: 2026-06-02T14:30:00+05:00
     Add database index for repository summary fallback
 
     Speed up the PostgreSQL query used when the Redis summary cache misses.
+
+M	backend/app/models/artifact.py
 
 commit 3333333333333333333333333333333333333333
 Author: Priya Rao <priya.rao@example.com>
@@ -22,6 +27,9 @@ Date: 2026-06-03T11:00:00Z
 
     Apply a per-repository rate limiter before parsing uploaded Git logs.
 
+M	backend/app/api/routes.py
+A	backend/app/services/rate_limit.py
+
 commit 4444444444444444444444444444444444444444
 Author: Luis Romero <luis.romero@example.com>
 Date: 2026-06-04T16:45:30-04:00
@@ -30,6 +38,8 @@ Date: 2026-06-04T16:45:30-04:00
 
     The retry worker backs off between attempts and stops after five failures.
 
+R100	backend/app/workers/retry_old.py	backend/app/workers/retry.py
+
 commit 5555555555555555555555555555555555555555
 Author: Sarah Jones <sarah.jones@example.com>
 Date: 2026-06-05T08:20:00+01:00
@@ -37,3 +47,6 @@ Date: 2026-06-05T08:20:00+01:00
     Polish dashboard UI empty state
 
     Align the empty-state copy and icon spacing with the investigation panel.
+
+M	app/page.tsx
+D	app/legacy-empty-state.tsx

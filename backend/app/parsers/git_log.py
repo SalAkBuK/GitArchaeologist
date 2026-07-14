@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from hashlib import sha256
 from datetime import UTC, datetime
 from uuid import UUID, uuid5
 
@@ -37,6 +38,36 @@ def stable_artifact_id(repository_id: str, commit_hash: str) -> str:
     return str(uuid5(ARTIFACT_ID_NAMESPACE, identity))
 
 
+def stable_modified_file_artifact_id(
+    repository_id: str,
+    commit_hash: str,
+    status: str,
+    path: str,
+    previous_path: str | None = None,
+) -> str:
+    identity = ":".join(
+        [
+            repository_id,
+            "modified_file",
+            commit_hash.lower(),
+            status,
+            previous_path or "",
+            path,
+        ]
+    )
+    return str(uuid5(ARTIFACT_ID_NAMESPACE, identity))
+
+
+def stable_modified_file_external_id(
+    commit_hash: str,
+    status: str,
+    path: str,
+    previous_path: str | None = None,
+) -> str:
+    identity = "\0".join([commit_hash.lower(), status, previous_path or "", path])
+    return sha256(identity.encode("utf-8")).hexdigest()
+
+
 def _unique_in_order(values: list[str]) -> list[str]:
     return list(dict.fromkeys(values))
 
@@ -68,6 +99,30 @@ def _parse_timestamp(raw_timestamp: str) -> datetime:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError("Date must include a timezone offset")
     return parsed.astimezone(UTC)
+
+
+def _split_message_and_file_lines(lines: list[str]) -> tuple[list[str], list[str]]:
+    message_lines: list[str] = []
+    file_lines: list[str] = []
+    reading_files = False
+
+    for line in lines:
+        if not reading_files and (line.startswith("    ") or not line.strip()):
+            message_lines.append(line)
+            continue
+        reading_files = True
+        file_lines.append(line)
+
+    return message_lines, file_lines
+
+
+def _status_label(status: str) -> str:
+    return {
+        "added": "Added",
+        "modified": "Modified",
+        "deleted": "Deleted",
+        "renamed": "Renamed",
+    }[status]
 
 
 class GitLogParser:
@@ -117,11 +172,12 @@ class GitLogParser:
             commit_hash = raw_hash.lower()
 
             try:
-                artifact = self._parse_record(
+                artifacts, errors = self._parse_record(
                     record_body,
                     normalized_repository_id,
                     commit_hash,
                     normalized_ingested_at,
+                    record_number,
                 )
             except ValueError as exc:
                 result.errors.append(
@@ -132,7 +188,8 @@ class GitLogParser:
                     )
                 )
             else:
-                result.artifacts.append(artifact)
+                result.artifacts.extend(artifacts)
+                result.errors.extend(errors)
 
         return result
 
@@ -142,7 +199,8 @@ class GitLogParser:
         repository_id: str,
         commit_hash: str,
         ingested_at: datetime,
-    ) -> ArtifactCreate:
+        record_number: int,
+    ) -> tuple[list[ArtifactCreate], list[IngestionValidationError]]:
         if not FULL_HASH_RE.fullmatch(commit_hash):
             raise ValueError("Commit hash must be a full 40- or 64-character hexadecimal hash")
 
@@ -181,7 +239,8 @@ class GitLogParser:
         if message_start is None:
             raise ValueError("Commit record is missing the blank line before its message")
 
-        message = _normalize_message(lines[message_start:])
+        message_lines, file_lines = _split_message_and_file_lines(lines[message_start:])
+        message = _normalize_message(message_lines)
         if not message:
             raise ValueError("Commit record has an empty commit message")
 
@@ -194,7 +253,7 @@ class GitLogParser:
         ]
         tags = [*(f"ticket:{ticket}" for ticket in tickets), *(f"component:{item}" for item in components)]
 
-        return ArtifactCreate(
+        commit_artifact = ArtifactCreate(
             id=stable_artifact_id(repository_id, commit_hash),
             repository_id=repository_id,
             external_id=commit_hash,
@@ -210,5 +269,105 @@ class GitLogParser:
                 "commitHash": commit_hash,
                 "ticketReferences": tickets,
                 "components": components,
+            },
+        )
+
+        artifacts = [commit_artifact]
+        errors: list[IngestionValidationError] = []
+        for file_line in file_lines:
+            if not file_line.strip():
+                continue
+            try:
+                artifacts.append(
+                    self._parse_file_record(
+                        file_line=file_line,
+                        repository_id=repository_id,
+                        commit_hash=commit_hash,
+                        author_name=author_name,
+                        author_email=author_email,
+                        occurred_at=timestamp,
+                        ingested_at=ingested_at,
+                    )
+                )
+            except ValueError as exc:
+                errors.append(
+                    IngestionValidationError(
+                        recordNumber=record_number,
+                        externalId=commit_hash,
+                        message=f"Malformed file record {file_line!r}: {exc}",
+                    )
+                )
+
+        return artifacts, errors
+
+    def _parse_file_record(
+        self,
+        *,
+        file_line: str,
+        repository_id: str,
+        commit_hash: str,
+        author_name: str,
+        author_email: str,
+        occurred_at: datetime,
+        ingested_at: datetime,
+    ) -> ArtifactCreate:
+        fields = file_line.split("\t")
+        raw_status = fields[0]
+        previous_path: str | None = None
+
+        if raw_status in {"A", "M", "D"}:
+            if len(fields) != 2 or not fields[1].strip():
+                raise ValueError("expected '<A|M|D>\\t<path>'")
+            status = {"A": "added", "M": "modified", "D": "deleted"}[raw_status]
+            path = fields[1].strip()
+        elif raw_status.startswith("R"):
+            if len(fields) != 3 or not fields[1].strip() or not fields[2].strip():
+                raise ValueError("expected 'R<score>\\t<previous path>\\t<path>'")
+            if not re.fullmatch(r"R\d{1,3}", raw_status):
+                raise ValueError("rename status must include a numeric similarity score")
+            status = "renamed"
+            previous_path = fields[1].strip()
+            path = fields[2].strip()
+        else:
+            raise ValueError("unsupported status; expected A, M, D, or R<score>")
+
+        label = _status_label(status)
+        title = f"{label} {path}"
+        summary = (
+            f"{label} file {previous_path} -> {path}"
+            if previous_path
+            else f"{label} file {path}"
+        )
+
+        return ArtifactCreate(
+            id=stable_modified_file_artifact_id(
+                repository_id,
+                commit_hash,
+                status,
+                path,
+                previous_path,
+            ),
+            repository_id=repository_id,
+            source_type="modified_file",
+            external_id=stable_modified_file_external_id(
+                commit_hash,
+                status,
+                path,
+                previous_path,
+            ),
+            title=title,
+            summary=summary,
+            body=summary,
+            author_name=author_name,
+            author_email=author_email,
+            occurred_at=occurred_at,
+            ingested_at=ingested_at,
+            tags=[f"commit:{commit_hash}", f"file_status:{status}"],
+            metadata={
+                "commitHash": commit_hash,
+                "path": path,
+                "previousPath": previous_path,
+                "changeStatus": status,
+                "rawStatus": raw_status,
             },
         )
