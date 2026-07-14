@@ -1,0 +1,1 @@
+"""GitArchaeologist backend application package."""

@@ -14,3 +14,11 @@ node_modules
 .next/
 *.tsbuildinfo
 .DS_Store
+
+# Python backend local state
+__pycache__/
+.pytest_cache/
+.venv/
+*.py[cod]
+backend/*.db
+backend/*.db-*

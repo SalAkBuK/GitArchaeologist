@@ -1,0 +1,39 @@
+commit 1111111111111111111111111111111111111111
+Author: Maya Chen <maya.chen@example.com>
+Date: 2026-06-01T09:15:00+00:00
+
+    JIRA-43 add Redis caching for repository summaries
+
+    Cache normalized repository summary responses in Redis for five minutes.
+
+commit 2222222222222222222222222222222222222222
+Author: Omar Siddiqui <omar.siddiqui@example.com>
+Date: 2026-06-02T14:30:00+05:00
+
+    Add database index for repository summary fallback
+
+    Speed up the PostgreSQL query used when the Redis summary cache misses.
+
+commit 3333333333333333333333333333333333333333
+Author: Priya Rao <priya.rao@example.com>
+Date: 2026-06-03T11:00:00Z
+
+    Enforce rate limiting on ingestion uploads
+
+    Apply a per-repository rate limiter before parsing uploaded Git logs.
+
+commit 4444444444444444444444444444444444444444
+Author: Luis Romero <luis.romero@example.com>
+Date: 2026-06-04T16:45:30-04:00
+
+    Add retry worker for transient ingestion failures
+
+    The retry worker backs off between attempts and stops after five failures.
+
+commit 5555555555555555555555555555555555555555
+Author: Sarah Jones <sarah.jones@example.com>
+Date: 2026-06-05T08:20:00+01:00
+
+    Polish dashboard UI empty state
+
+    Align the empty-state copy and icon spacing with the investigation panel.

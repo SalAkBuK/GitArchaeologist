@@ -1,0 +1,214 @@
+from __future__ import annotations
+
+import re
+from datetime import UTC, datetime
+from uuid import UUID, uuid5
+
+from pydantic import BaseModel, Field
+
+from app.schemas.artifact import ArtifactCreate
+from app.schemas.ingestion import IngestionValidationError
+
+
+ARTIFACT_ID_NAMESPACE = UUID("79ab69cc-01a8-4dc3-9a51-1b585c6d83a8")
+COMMIT_HEADER_RE = re.compile(r"(?m)^commit[ \t]+([^\r\n]+?)[ \t]*$")
+FULL_HASH_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
+AUTHOR_RE = re.compile(r"^Author:\s*(.+?)\s*<([^<>\s]+@[^<>\s]+)>\s*$")
+DATE_RE = re.compile(r"^Date:\s*(\S+)\s*$")
+TICKET_RE = re.compile(r"\b[A-Z][A-Z0-9]+-\d+\b")
+
+COMPONENT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("redis", re.compile(r"\bredis\b", re.IGNORECASE)),
+    ("postgresql", re.compile(r"\b(?:postgres|postgresql)\b", re.IGNORECASE)),
+    ("database", re.compile(r"\bdatabase\b|\bdb\b", re.IGNORECASE)),
+    ("rate-limiter", re.compile(r"\brate[- ]?limit(?:er|ing)?\b", re.IGNORECASE)),
+    ("retry-worker", re.compile(r"\bretry[- ]worker\b", re.IGNORECASE)),
+    ("ui", re.compile(r"\bui\b|\buser interface\b", re.IGNORECASE)),
+)
+
+
+class GitParseResult(BaseModel):
+    artifacts: list[ArtifactCreate] = Field(default_factory=list)
+    errors: list[IngestionValidationError] = Field(default_factory=list)
+
+
+def stable_artifact_id(repository_id: str, commit_hash: str) -> str:
+    identity = f"{repository_id}:git_commit:{commit_hash.lower()}"
+    return str(uuid5(ARTIFACT_ID_NAMESPACE, identity))
+
+
+def _unique_in_order(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(values))
+
+
+def _normalize_message(lines: list[str]) -> str:
+    normalized_lines = [line[4:] if line.startswith("    ") else line for line in lines]
+    while normalized_lines and not normalized_lines[0].strip():
+        normalized_lines.pop(0)
+    while normalized_lines and not normalized_lines[-1].strip():
+        normalized_lines.pop()
+    return "\n".join(line.rstrip() for line in normalized_lines).strip()
+
+
+def _summary_from_message(message: str, maximum_length: int = 280) -> str:
+    first_paragraph = re.split(r"\n\s*\n", message, maxsplit=1)[0]
+    summary = " ".join(first_paragraph.split())
+    if len(summary) <= maximum_length:
+        return summary
+    shortened = summary[: maximum_length - 1].rsplit(" ", maxsplit=1)[0]
+    return f"{shortened or summary[: maximum_length - 3]}..."
+
+
+def _parse_timestamp(raw_timestamp: str) -> datetime:
+    candidate = raw_timestamp.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError as exc:
+        raise ValueError("Date must be an ISO 8601 timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("Date must include a timezone offset")
+    return parsed.astimezone(UTC)
+
+
+class GitLogParser:
+    def parse(
+        self,
+        content: str,
+        repository_id: str,
+        *,
+        ingested_at: datetime | None = None,
+    ) -> GitParseResult:
+        result = GitParseResult()
+        if not content.strip():
+            return result
+
+        normalized_repository_id = repository_id.strip()
+        if not normalized_repository_id:
+            result.errors.append(
+                IngestionValidationError(recordNumber=1, message="Repository ID is required")
+            )
+            return result
+
+        matches = list(COMMIT_HEADER_RE.finditer(content))
+        if not matches:
+            result.errors.append(
+                IngestionValidationError(
+                    recordNumber=1,
+                    message="Expected a record beginning with 'commit <full hash>'",
+                )
+            )
+            return result
+
+        preamble = content[: matches[0].start()]
+        if preamble.strip():
+            result.errors.append(
+                IngestionValidationError(
+                    recordNumber=1,
+                    message="Unexpected content before the first commit record",
+                )
+            )
+
+        normalized_ingested_at = (ingested_at or datetime.now(UTC)).astimezone(UTC)
+        for index, match in enumerate(matches):
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(content)
+            record_body = content[match.end() : end]
+            record_number = index + 1
+            raw_hash = match.group(1).strip()
+            commit_hash = raw_hash.lower()
+
+            try:
+                artifact = self._parse_record(
+                    record_body,
+                    normalized_repository_id,
+                    commit_hash,
+                    normalized_ingested_at,
+                )
+            except ValueError as exc:
+                result.errors.append(
+                    IngestionValidationError(
+                        recordNumber=record_number,
+                        externalId=commit_hash if FULL_HASH_RE.fullmatch(raw_hash) else None,
+                        message=str(exc),
+                    )
+                )
+            else:
+                result.artifacts.append(artifact)
+
+        return result
+
+    def _parse_record(
+        self,
+        body: str,
+        repository_id: str,
+        commit_hash: str,
+        ingested_at: datetime,
+    ) -> ArtifactCreate:
+        if not FULL_HASH_RE.fullmatch(commit_hash):
+            raise ValueError("Commit hash must be a full 40- or 64-character hexadecimal hash")
+
+        lines = body.splitlines()
+        while lines and not lines[0].strip():
+            lines.pop(0)
+
+        author_name: str | None = None
+        author_email: str | None = None
+        timestamp: datetime | None = None
+        message_start: int | None = None
+
+        for line_index, line in enumerate(lines):
+            if not line.strip():
+                message_start = line_index + 1
+                break
+            author_match = AUTHOR_RE.fullmatch(line)
+            if author_match:
+                if author_name is not None:
+                    raise ValueError("Commit record contains more than one Author header")
+                author_name = author_match.group(1).strip()
+                author_email = author_match.group(2).strip()
+                continue
+            date_match = DATE_RE.fullmatch(line)
+            if date_match:
+                if timestamp is not None:
+                    raise ValueError("Commit record contains more than one Date header")
+                timestamp = _parse_timestamp(date_match.group(1))
+                continue
+            raise ValueError(f"Unexpected commit header: {line.strip()!r}")
+
+        if not author_name or not author_email:
+            raise ValueError("Commit record is missing a valid 'Author: Name <email>' header")
+        if timestamp is None:
+            raise ValueError("Commit record is missing a valid 'Date: <ISO 8601 timestamp>' header")
+        if message_start is None:
+            raise ValueError("Commit record is missing the blank line before its message")
+
+        message = _normalize_message(lines[message_start:])
+        if not message:
+            raise ValueError("Commit record has an empty commit message")
+
+        title = next(line.strip() for line in message.splitlines() if line.strip())
+        tickets = _unique_in_order(TICKET_RE.findall(message))
+        components = [
+            component
+            for component, pattern in COMPONENT_PATTERNS
+            if pattern.search(message)
+        ]
+        tags = [*(f"ticket:{ticket}" for ticket in tickets), *(f"component:{item}" for item in components)]
+
+        return ArtifactCreate(
+            id=stable_artifact_id(repository_id, commit_hash),
+            repository_id=repository_id,
+            external_id=commit_hash,
+            title=title,
+            summary=_summary_from_message(message),
+            body=message,
+            author_name=author_name,
+            author_email=author_email,
+            occurred_at=timestamp,
+            ingested_at=ingested_at,
+            tags=tags,
+            metadata={
+                "commitHash": commit_hash,
+                "ticketReferences": tickets,
+                "components": components,
+            },
+        )
