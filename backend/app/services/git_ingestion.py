@@ -15,12 +15,14 @@ class GitIngestionService:
     def ingest(self, repository_id: str, content: str) -> IngestionResult:
         normalized_repository_id = repository_id.strip()
         parse_result = self.parser.parse(content, normalized_repository_id)
-        inserted, skipped = self.repository.insert_new(parse_result.artifacts)
+        reconciliation = self.repository.reconcile_snapshots(parse_result.artifacts)
         return IngestionResult(
             repositoryId=normalized_repository_id,
             recordsParsed=len(parse_result.artifacts),
-            recordsInserted=inserted,
-            recordsSkippedAsDuplicates=skipped,
+            recordsInserted=reconciliation.inserted,
+            recordsUpdated=reconciliation.updated,
+            recordsDeleted=reconciliation.deleted,
+            recordsSkippedAsDuplicates=reconciliation.unchanged,
             recordsRejected=len(parse_result.errors),
             validationErrors=parse_result.errors,
         )

@@ -17,6 +17,8 @@ class IngestionResult(BaseModel):
     repository_id: str = Field(alias="repositoryId")
     records_parsed: int = Field(alias="recordsParsed")
     records_inserted: int = Field(alias="recordsInserted")
+    records_updated: int = Field(default=0, alias="recordsUpdated")
+    records_deleted: int = Field(default=0, alias="recordsDeleted")
     records_skipped_as_duplicates: int = Field(alias="recordsSkippedAsDuplicates")
     records_rejected: int = Field(alias="recordsRejected")
     validation_errors: list[IngestionValidationError] = Field(alias="validationErrors")

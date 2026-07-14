@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import shutil
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
+
+import pytest
 
 from app.parsers.git_log import GitLogParser, stable_artifact_id
 
@@ -238,3 +242,159 @@ def test_file_records_do_not_leak_between_commits() -> None:
     files = [artifact for artifact in result.artifacts if artifact.source_type == "modified_file"]
     assert len(files) == 1
     assert files[0].metadata["commitHash"] == HASH_ONE
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
+def test_parses_supported_newline_styles(newline: str) -> None:
+    content = commit_record(files=["M\tbackend/app/main.py"]).replace("\n", newline)
+
+    result = GitLogParser().parse(content, "acme/platform")
+
+    assert result.errors == []
+    assert len(result.artifacts) == 2
+
+
+@pytest.mark.parametrize(
+    ("raw_path", "expected"),
+    [
+        ("src/main.py", "src/main.py"),
+        ("dir with spaces/file.py", "dir with spaces/file.py"),
+        ("café.py", "café.py"),
+        ('"dir with spaces/caf\\303\\251.txt"', "dir with spaces/café.txt"),
+        ('"path/\\"quoted\\".txt"', 'path/"quoted".txt'),
+        ('"path\\\\name.txt"', "path\\name.txt"),
+        ('"path/line\\tbreak\\n.txt"', "path/line\tbreak\n.txt"),
+    ],
+)
+def test_decodes_git_file_paths(raw_path: str, expected: str) -> None:
+    result = GitLogParser().parse(
+        commit_record(files=[f"M\t{raw_path}"]),
+        "acme/platform",
+    )
+
+    assert result.errors == []
+    assert result.artifacts[1].metadata["path"] == expected
+
+
+def test_decodes_quoted_rename_paths() -> None:
+    result = GitLogParser().parse(
+        commit_record(files=['R095\t"old/caf\\303\\251.txt"\t"new/caf\\303\\251.txt"']),
+        "acme/platform",
+    )
+
+    file_artifact = result.artifacts[1]
+    assert result.errors == []
+    assert file_artifact.metadata["previousPath"] == "old/café.txt"
+    assert file_artifact.metadata["path"] == "new/café.txt"
+
+
+def test_invalid_quoted_path_and_copy_status_are_precise_record_errors() -> None:
+    result = GitLogParser().parse(
+        commit_record(files=['M\t"bad\\q.txt"', "C100\told.py\tcopy.py", "A\tvalid.py"]),
+        "acme/platform",
+    )
+
+    assert [artifact.metadata.get("path") for artifact in result.artifacts[1:]] == ["valid.py"]
+    assert len(result.errors) == 2
+    assert "unsupported path escape" in result.errors[0].message
+    assert "copy status C<score> is not supported" in result.errors[1].message
+
+
+def test_malformed_file_error_truncates_extremely_long_records() -> None:
+    result = GitLogParser().parse(
+        commit_record(files=[f"X\t{'a' * 1000}"]),
+        "acme/platform",
+    )
+
+    assert len(result.errors[0].message) < 300
+
+
+def test_preserves_empty_message_commit_and_attached_file() -> None:
+    result = GitLogParser().parse(
+        commit_record(message="", files=["A\tempty-message.txt"]),
+        "acme/platform",
+    )
+
+    commit, file_artifact = result.artifacts
+    assert result.errors == []
+    assert commit.title == f"Commit {HASH_ONE[:7]}"
+    assert commit.summary == ""
+    assert commit.body == ""
+    assert file_artifact.metadata["commitHash"] == HASH_ONE
+
+
+def test_parses_actual_git_output_from_documented_command(tmp_path: Path) -> None:
+    git = shutil.which("git")
+    if git is None:
+        pytest.skip("Git is not installed")
+
+    repository = tmp_path / "repository"
+    log_path = tmp_path / "git_log.txt"
+    repository.mkdir()
+
+    def run(*arguments: str) -> None:
+        subprocess.run(
+            [git, "-C", str(repository), *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    run("init", "--quiet")
+    run("config", "user.name", "Real Git User")
+    run("config", "user.email", "real-git@example.com")
+    unicode_file = repository / "dir with spaces" / "café.txt"
+    unicode_file.parent.mkdir()
+    unicode_file.write_text("first\n", encoding="utf-8")
+    run("add", ".")
+    run("commit", "--quiet", "-m", "Subject", "-m", "Multiline body")
+
+    unicode_file.write_text("second\n", encoding="utf-8")
+    empty_message = tmp_path / "empty-message.txt"
+    empty_message.write_bytes(b"")
+    run("add", ".")
+    run("commit", "--quiet", "--allow-empty-message", "-F", str(empty_message))
+    empty_sha = subprocess.run(
+        [git, "-C", str(repository), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    renamed_file = repository / "dir with spaces" / "renamed café.txt"
+    run("mv", "dir with spaces/café.txt", "dir with spaces/renamed café.txt")
+    run("commit", "--quiet", "-m", "Rename Unicode file")
+    deleted_file = repository / "delete-me.bin"
+    deleted_file.write_bytes(b"\x00\x01\xff")
+    run("add", ".")
+    run("commit", "--quiet", "-m", "Add binary file")
+    deleted_file.unlink()
+    run("add", "--all")
+    run("commit", "--quiet", "-m", "Delete binary file")
+
+    run(
+        "-c",
+        "core.quotepath=false",
+        "log",
+        "--date=iso-strict",
+        "--name-status",
+        "--pretty=format:commit %H%nAuthor: %an <%ae>%nDate: %aI%n%n%w(0,4,4)%B%n",
+        f"--output={log_path}",
+    )
+
+    result = GitLogParser().parse(log_path.read_text(encoding="utf-8"), "real/repo")
+
+    assert result.errors == []
+    commits = [artifact for artifact in result.artifacts if artifact.source_type == "git_commit"]
+    files = [artifact for artifact in result.artifacts if artifact.source_type == "modified_file"]
+    empty_commit = next(artifact for artifact in commits if artifact.external_id == empty_sha)
+    assert empty_commit.title == f"Commit {empty_sha[:7]}"
+    assert empty_commit.body == ""
+    assert {artifact.metadata["changeStatus"] for artifact in files} == {
+        "added",
+        "modified",
+        "renamed",
+        "deleted",
+    }
+    assert any(artifact.metadata["path"] == "dir with spaces/renamed café.txt" for artifact in files)
+    assert renamed_file.exists()

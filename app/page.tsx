@@ -1,6 +1,6 @@
 'use client'
 
-import { FormEvent, useEffect, useMemo, useState } from 'react'
+import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from 'react'
 import {
   AlertTriangle,
   CheckCircle2,
@@ -12,42 +12,19 @@ import {
   Upload,
 } from 'lucide-react'
 import type { Artifact } from '@/lib/domain'
+import {
+  ApiResponseError,
+  apiErrorFromResponse,
+  parseArtifactList,
+  parseCommitInvestigation,
+  parseIngestionResult,
+  type CommitInvestigation,
+  type MissingContextWarning,
+} from '@/lib/live-api'
 
-interface EvidenceEdge {
-  id: string
-  fromArtifactId: string
-  toArtifactId: string
-  relationType: 'modifies'
-  label: string
-  explanation: string
-  confidence: number
-  direct: boolean
-}
-
-interface EvidenceStatus {
-  status: 'verified_evidence' | 'missing_context'
-  label: string
-  artifactIds: string[]
-  edgeIds: string[]
-}
-
-interface MissingContextWarning {
-  code:
-    | 'missing_pull_request'
-    | 'missing_issue'
-    | 'missing_human_rationale'
-    | 'missing_modified_files'
+interface ApplicationError {
+  title: string
   message: string
-}
-
-interface CommitInvestigation {
-  repositoryId: string
-  commitSha: string
-  selectedCommit: Artifact
-  modifiedFiles: Artifact[]
-  evidenceEdges: EvidenceEdge[]
-  evidenceStatus: EvidenceStatus[]
-  missingContextWarnings: MissingContextWarning[]
 }
 
 const API_BASE_URL =
@@ -82,6 +59,50 @@ function filePath(artifact: Artifact) {
   return typeof path === 'string' ? path : artifact.title
 }
 
+function isAbortError(error: unknown) {
+  return error instanceof Error && error.name === 'AbortError'
+}
+
+function presentError(error: unknown, operation: 'list' | 'investigation' | 'upload'): ApplicationError {
+  if (error instanceof ApiResponseError) {
+    if (error.status === 422) {
+      return {
+        title:
+          operation !== 'upload' || error.message.toLowerCase().includes('repositoryid')
+            ? 'Invalid repository'
+            : 'Invalid uploaded file',
+        message: error.message,
+      }
+    }
+    if (operation === 'upload' && (error.status === 400 || error.status === 413)) {
+      return { title: 'Invalid Git log', message: error.message }
+    }
+    return { title: 'Backend request failed', message: error.message }
+  }
+  if (error instanceof Error && error.message.startsWith('Backend returned')) {
+    return { title: 'Invalid backend response', message: error.message }
+  }
+  return {
+    title: 'Backend unavailable',
+    message: error instanceof Error ? error.message : 'The backend request failed',
+  }
+}
+
+function MissingContextList({ warnings }: { warnings: MissingContextWarning[] }) {
+  return (
+    <ul className="flex flex-col gap-3">
+      {warnings.map((warning) => (
+        <li key={warning.code} className="rounded-xl border border-border bg-card p-3">
+          <p className="font-mono text-[10px] uppercase tracking-widest text-primary">
+            {warning.code.replaceAll('_', ' ')}
+          </p>
+          <p className="mt-2 text-sm leading-relaxed text-muted-foreground">{warning.message}</p>
+        </li>
+      ))}
+    </ul>
+  )
+}
+
 export default function Page() {
   const [repositoryId, setRepositoryId] = useState(DEFAULT_REPOSITORY_ID)
   const [commits, setCommits] = useState<Artifact[]>([])
@@ -89,57 +110,70 @@ export default function Page() {
   const [investigation, setInvestigation] = useState<CommitInvestigation | null>(null)
   const [loadingCommits, setLoadingCommits] = useState(true)
   const [loadingInvestigation, setLoadingInvestigation] = useState(false)
-  const [backendError, setBackendError] = useState<string | null>(null)
+  const [applicationError, setApplicationError] = useState<ApplicationError | null>(null)
   const [notFound, setNotFound] = useState(false)
   const [uploadMessage, setUploadMessage] = useState<string | null>(null)
   const [uploading, setUploading] = useState(false)
+  const commitListController = useRef<AbortController | null>(null)
+  const investigationController = useRef<AbortController | null>(null)
+  const uploadController = useRef<AbortController | null>(null)
+  const commitListRequestId = useRef(0)
+  const investigationRequestId = useRef(0)
+  const uploadRequestId = useRef(0)
 
   const normalizedRepositoryId = repositoryId.trim()
+  const activeRepositoryId = useRef(normalizedRepositoryId)
+  activeRepositoryId.current = normalizedRepositoryId
 
   useEffect(() => {
-    let cancelled = false
+    commitListController.current?.abort()
+    const controller = new AbortController()
+    commitListController.current = controller
+    const requestId = ++commitListRequestId.current
+
+    setCommits([])
+    setSelectedSha(null)
+    setInvestigation(null)
+    setNotFound(false)
 
     async function loadCommits() {
       if (!normalizedRepositoryId) {
-        setCommits([])
-        setSelectedSha(null)
         setLoadingCommits(false)
         return
       }
 
       setLoadingCommits(true)
-      setBackendError(null)
+      setApplicationError(null)
       setUploadMessage(null)
       try {
         const params = new URLSearchParams({
           repositoryId: normalizedRepositoryId,
           sourceType: 'git_commit',
         })
-        const response = await fetch(`${API_BASE_URL}/api/artifacts?${params}`)
+        const response = await fetch(`${API_BASE_URL}/api/artifacts?${params}`, {
+          signal: controller.signal,
+        })
         if (!response.ok) {
-          throw new Error(`Backend returned ${response.status}`)
+          throw await apiErrorFromResponse(response)
         }
-        const data = (await response.json()) as Artifact[]
-        if (cancelled) {
+        const data = parseArtifactList(await response.json())
+        if (requestId !== commitListRequestId.current || controller.signal.aborted) {
           return
         }
         setCommits(data)
-        setSelectedSha((current) => {
-          if (current && data.some((commit) => commit.externalId === current)) {
-            return current
-          }
-          return data[0]?.externalId ?? null
-        })
+        setSelectedSha(data[0]?.externalId ?? null)
       } catch (error) {
-        if (!cancelled) {
-          setBackendError(
-            error instanceof Error ? error.message : 'Backend request failed',
-          )
+        if (
+          !isAbortError(error) &&
+          requestId === commitListRequestId.current &&
+          !controller.signal.aborted
+        ) {
+          setApplicationError(presentError(error, 'list'))
           setCommits([])
           setSelectedSha(null)
         }
       } finally {
-        if (!cancelled) {
+        if (requestId === commitListRequestId.current) {
           setLoadingCommits(false)
         }
       }
@@ -147,51 +181,55 @@ export default function Page() {
 
     loadCommits()
     return () => {
-      cancelled = true
+      controller.abort()
     }
   }, [normalizedRepositoryId])
 
   useEffect(() => {
-    let cancelled = false
+    investigationController.current?.abort()
+    const controller = new AbortController()
+    investigationController.current = controller
+    const requestId = ++investigationRequestId.current
+    setInvestigation(null)
+    setNotFound(false)
 
     async function loadInvestigation() {
       if (!selectedSha || !normalizedRepositoryId) {
-        setInvestigation(null)
-        setNotFound(false)
+        setLoadingInvestigation(false)
         return
       }
 
       setLoadingInvestigation(true)
-      setBackendError(null)
-      setNotFound(false)
+      setApplicationError(null)
       try {
         const params = new URLSearchParams({ repositoryId: normalizedRepositoryId })
         const response = await fetch(
           `${API_BASE_URL}/api/investigations/commits/${selectedSha}?${params}`,
+          { signal: controller.signal },
         )
         if (response.status === 404) {
-          if (!cancelled) {
-            setInvestigation(null)
+          if (requestId === investigationRequestId.current && !controller.signal.aborted) {
             setNotFound(true)
           }
           return
         }
         if (!response.ok) {
-          throw new Error(`Backend returned ${response.status}`)
+          throw await apiErrorFromResponse(response)
         }
-        const data = (await response.json()) as CommitInvestigation
-        if (!cancelled) {
+        const data = parseCommitInvestigation(await response.json())
+        if (requestId === investigationRequestId.current && !controller.signal.aborted) {
           setInvestigation(data)
         }
       } catch (error) {
-        if (!cancelled) {
-          setBackendError(
-            error instanceof Error ? error.message : 'Backend request failed',
-          )
-          setInvestigation(null)
+        if (
+          !isAbortError(error) &&
+          requestId === investigationRequestId.current &&
+          !controller.signal.aborted
+        ) {
+          setApplicationError(presentError(error, 'investigation'))
         }
       } finally {
-        if (!cancelled) {
+        if (requestId === investigationRequestId.current) {
           setLoadingInvestigation(false)
         }
       }
@@ -199,7 +237,7 @@ export default function Page() {
 
     loadInvestigation()
     return () => {
-      cancelled = true
+      controller.abort()
     }
   }, [normalizedRepositoryId, selectedSha])
 
@@ -207,6 +245,33 @@ export default function Page() {
     () => commits.find((commit) => commit.externalId === selectedSha),
     [commits, selectedSha],
   )
+
+  function handleRepositoryChange(event: ChangeEvent<HTMLInputElement>) {
+    commitListController.current?.abort()
+    investigationController.current?.abort()
+    uploadController.current?.abort()
+    commitListRequestId.current += 1
+    investigationRequestId.current += 1
+    uploadRequestId.current += 1
+    setCommits([])
+    setSelectedSha(null)
+    setInvestigation(null)
+    setNotFound(false)
+    setLoadingCommits(false)
+    setLoadingInvestigation(false)
+    setUploading(false)
+    setApplicationError(null)
+    setUploadMessage(null)
+    setRepositoryId(event.target.value)
+  }
+
+  function handleCommitSelection(commitSha: string) {
+    investigationController.current?.abort()
+    investigationRequestId.current += 1
+    setInvestigation(null)
+    setNotFound(false)
+    setSelectedSha(commitSha)
+  }
 
   async function handleUpload(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -218,47 +283,81 @@ export default function Page() {
       return
     }
 
+    const targetRepositoryId = normalizedRepositoryId
     const payload = new FormData()
-    payload.append('repositoryId', normalizedRepositoryId)
+    payload.append('repositoryId', targetRepositoryId)
     payload.append('file', file)
 
+    uploadController.current?.abort()
+    const controller = new AbortController()
+    uploadController.current = controller
+    const requestId = ++uploadRequestId.current
     setUploading(true)
     setUploadMessage(null)
-    setBackendError(null)
+    setApplicationError(null)
     try {
       const response = await fetch(`${API_BASE_URL}/api/ingestions/git`, {
         method: 'POST',
         body: payload,
+        signal: controller.signal,
       })
       if (!response.ok) {
-        throw new Error(`Upload failed with ${response.status}`)
+        throw await apiErrorFromResponse(response)
       }
-      const result = (await response.json()) as {
-        recordsInserted: number
-        recordsSkippedAsDuplicates: number
-        recordsRejected: number
+      const result = parseIngestionResult(await response.json())
+      if (
+        requestId !== uploadRequestId.current ||
+        controller.signal.aborted ||
+        activeRepositoryId.current !== targetRepositoryId
+      ) {
+        return
       }
+      const countSummary = `Inserted ${result.recordsInserted}, updated ${result.recordsUpdated}, removed ${result.recordsDeleted}, skipped ${result.recordsSkippedAsDuplicates}, rejected ${result.recordsRejected}.`
+      const validationSummary = result.validationErrors[0]?.message
       setUploadMessage(
-        `Inserted ${result.recordsInserted}, skipped ${result.recordsSkippedAsDuplicates}, rejected ${result.recordsRejected}.`,
+        validationSummary
+          ? `${countSummary} Malformed record: ${validationSummary}`
+          : countSummary,
       )
       form.reset()
+
+      commitListController.current?.abort()
+      const listRequestId = ++commitListRequestId.current
       setLoadingCommits(true)
       const params = new URLSearchParams({
-        repositoryId: normalizedRepositoryId,
+        repositoryId: targetRepositoryId,
         sourceType: 'git_commit',
       })
-      const listResponse = await fetch(`${API_BASE_URL}/api/artifacts?${params}`)
+      const listResponse = await fetch(`${API_BASE_URL}/api/artifacts?${params}`, {
+        signal: controller.signal,
+      })
       if (!listResponse.ok) {
-        throw new Error(`Backend returned ${listResponse.status}`)
+        throw await apiErrorFromResponse(listResponse)
       }
-      const data = (await listResponse.json()) as Artifact[]
+      const data = parseArtifactList(await listResponse.json())
+      if (
+        requestId !== uploadRequestId.current ||
+        listRequestId !== commitListRequestId.current ||
+        controller.signal.aborted ||
+        activeRepositoryId.current !== targetRepositoryId
+      ) {
+        return
+      }
       setCommits(data)
       setSelectedSha(data[0]?.externalId ?? null)
     } catch (error) {
-      setBackendError(error instanceof Error ? error.message : 'Upload failed')
+      if (
+        !isAbortError(error) &&
+        requestId === uploadRequestId.current &&
+        !controller.signal.aborted
+      ) {
+        setApplicationError(presentError(error, 'upload'))
+      }
     } finally {
-      setUploading(false)
-      setLoadingCommits(false)
+      if (requestId === uploadRequestId.current) {
+        setUploading(false)
+        setLoadingCommits(false)
+      }
     }
   }
 
@@ -288,7 +387,7 @@ export default function Page() {
               </label>
               <input
                 value={repositoryId}
-                onChange={(event) => setRepositoryId(event.target.value)}
+                onChange={handleRepositoryChange}
                 className="w-full rounded-lg border border-border bg-card px-3 py-2 text-sm outline-none focus:border-primary/50"
               />
             </div>
@@ -347,7 +446,11 @@ export default function Page() {
                     <li key={commit.id}>
                       <button
                         type="button"
-                        onClick={() => setSelectedSha(commit.externalId ?? null)}
+                        onClick={() => {
+                          if (commit.externalId) {
+                            handleCommitSelection(commit.externalId)
+                          }
+                        }}
                         className={`w-full rounded-lg border p-3 text-left transition-colors ${
                           selectedSha === commit.externalId
                             ? 'border-primary/50 bg-primary/10'
@@ -374,23 +477,23 @@ export default function Page() {
 
         <main className="min-w-0 flex-1 overflow-y-auto p-4 md:p-6">
           <div className="mx-auto flex max-w-4xl flex-col gap-5">
-            {backendError && (
+            {applicationError && (
               <section className="rounded-xl border border-destructive/40 bg-destructive/10 p-4">
                 <div className="flex items-center gap-2 text-destructive">
                   <AlertTriangle className="size-4" aria-hidden="true" />
-                  <h2 className="text-sm font-semibold">Backend unavailable</h2>
+                  <h2 className="text-sm font-semibold">{applicationError.title}</h2>
                 </div>
-                <p className="mt-2 text-sm text-muted-foreground">{backendError}</p>
+                <p className="mt-2 text-sm text-muted-foreground">{applicationError.message}</p>
               </section>
             )}
 
-            {!backendError && loadingInvestigation && (
+            {!applicationError && loadingInvestigation && (
               <section className="rounded-xl border border-border bg-card p-5 text-sm text-muted-foreground">
                 Loading commit investigation.
               </section>
             )}
 
-            {!backendError && notFound && (
+            {!applicationError && notFound && (
               <section className="rounded-xl border border-border bg-card p-5">
                 <h1 className="text-lg font-semibold">Commit not found</h1>
                 <p className="mt-2 text-sm text-muted-foreground">
@@ -399,7 +502,7 @@ export default function Page() {
               </section>
             )}
 
-            {!backendError && !loadingInvestigation && !investigation && !notFound && (
+            {!applicationError && !loadingInvestigation && !investigation && !notFound && (
               <section className="rounded-xl border border-border bg-card p-5">
                 <h1 className="text-lg font-semibold">No commit selected</h1>
                 <p className="mt-2 text-sm text-muted-foreground">
@@ -533,6 +636,16 @@ export default function Page() {
                     </ul>
                   )}
                 </section>
+
+                <section className="rounded-2xl border border-border bg-sidebar p-5 xl:hidden">
+                  <div className="mb-4 flex items-center gap-2">
+                    <AlertTriangle className="size-4 text-primary" aria-hidden="true" />
+                    <h2 className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
+                      Missing Context
+                    </h2>
+                  </div>
+                  <MissingContextList warnings={investigation.missingContextWarnings} />
+                </section>
               </>
             )}
           </div>
@@ -547,18 +660,7 @@ export default function Page() {
               </h2>
             </div>
             {investigation ? (
-              <ul className="flex flex-col gap-3">
-                {investigation.missingContextWarnings.map((warning) => (
-                  <li key={warning.code} className="rounded-xl border border-border bg-card p-3">
-                    <p className="font-mono text-[10px] uppercase tracking-widest text-primary">
-                      {warning.code.replaceAll('_', ' ')}
-                    </p>
-                    <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
-                      {warning.message}
-                    </p>
-                  </li>
-                ))}
-              </ul>
+              <MissingContextList warnings={investigation.missingContextWarnings} />
             ) : (
               <p className="rounded-xl border border-border bg-card p-3 text-sm text-muted-foreground">
                 Missing-context warnings appear after a commit investigation loads.

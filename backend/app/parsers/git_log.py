@@ -27,6 +27,19 @@ COMPONENT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("ui", re.compile(r"\bui\b|\buser interface\b", re.IGNORECASE)),
 )
 
+GIT_PATH_ESCAPE_BYTES = {
+    "a": 0x07,
+    "b": 0x08,
+    "t": 0x09,
+    "n": 0x0A,
+    "v": 0x0B,
+    "f": 0x0C,
+    "r": 0x0D,
+    '"': 0x22,
+    "\\": 0x5C,
+}
+MAX_ERROR_RECORD_LENGTH = 200
+
 
 class GitParseResult(BaseModel):
     artifacts: list[ArtifactCreate] = Field(default_factory=list)
@@ -90,6 +103,55 @@ def _summary_from_message(message: str, maximum_length: int = 280) -> str:
     return f"{shortened or summary[: maximum_length - 3]}..."
 
 
+def decode_git_path(raw_path: str) -> str:
+    """Decode the C-style path quoting emitted by Git name-status output."""
+    if not raw_path.startswith('"'):
+        return raw_path
+    if len(raw_path) < 2 or not raw_path.endswith('"'):
+        raise ValueError("quoted path is missing its closing double quote")
+
+    encoded = bytearray()
+    content = raw_path[1:-1]
+    index = 0
+    while index < len(content):
+        character = content[index]
+        if character != "\\":
+            encoded.extend(character.encode("utf-8"))
+            index += 1
+            continue
+
+        index += 1
+        if index >= len(content):
+            raise ValueError("quoted path ends with an incomplete escape")
+        escape = content[index]
+        if escape in GIT_PATH_ESCAPE_BYTES:
+            encoded.append(GIT_PATH_ESCAPE_BYTES[escape])
+            index += 1
+            continue
+        if escape in "01234567":
+            end = index + 1
+            while end < len(content) and end < index + 3 and content[end] in "01234567":
+                end += 1
+            value = int(content[index:end], 8)
+            if value > 0xFF:
+                raise ValueError("octal escape is outside the byte range")
+            encoded.append(value)
+            index = end
+            continue
+        raise ValueError(f"unsupported path escape \\{escape}")
+
+    try:
+        return encoded.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("quoted path contains invalid UTF-8 byte escapes") from exc
+
+
+def _record_excerpt(value: str) -> str:
+    if len(value) <= MAX_ERROR_RECORD_LENGTH:
+        return value
+    return f"{value[: MAX_ERROR_RECORD_LENGTH - 3]}..."
+
+
 def _parse_timestamp(raw_timestamp: str) -> datetime:
     candidate = raw_timestamp.replace("Z", "+00:00")
     try:
@@ -134,6 +196,7 @@ class GitLogParser:
         ingested_at: datetime | None = None,
     ) -> GitParseResult:
         result = GitParseResult()
+        content = content.replace("\r\n", "\n").replace("\r", "\n")
         if not content.strip():
             return result
 
@@ -241,10 +304,10 @@ class GitLogParser:
 
         message_lines, file_lines = _split_message_and_file_lines(lines[message_start:])
         message = _normalize_message(message_lines)
-        if not message:
-            raise ValueError("Commit record has an empty commit message")
-
-        title = next(line.strip() for line in message.splitlines() if line.strip())
+        title = next(
+            (line.strip() for line in message.splitlines() if line.strip()),
+            f"Commit {commit_hash[:7]}",
+        )
         tickets = _unique_in_order(TICKET_RE.findall(message))
         components = [
             component
@@ -294,7 +357,7 @@ class GitLogParser:
                     IngestionValidationError(
                         recordNumber=record_number,
                         externalId=commit_hash,
-                        message=f"Malformed file record {file_line!r}: {exc}",
+                        message=f"Malformed file record {_record_excerpt(file_line)!r}: {exc}",
                     )
                 )
 
@@ -316,20 +379,27 @@ class GitLogParser:
         previous_path: str | None = None
 
         if raw_status in {"A", "M", "D"}:
-            if len(fields) != 2 or not fields[1].strip():
+            if len(fields) != 2:
                 raise ValueError("expected '<A|M|D>\\t<path>'")
             status = {"A": "added", "M": "modified", "D": "deleted"}[raw_status]
-            path = fields[1].strip()
+            path = decode_git_path(fields[1])
         elif raw_status.startswith("R"):
-            if len(fields) != 3 or not fields[1].strip() or not fields[2].strip():
+            if len(fields) != 3:
                 raise ValueError("expected 'R<score>\\t<previous path>\\t<path>'")
             if not re.fullmatch(r"R\d{1,3}", raw_status):
                 raise ValueError("rename status must include a numeric similarity score")
             status = "renamed"
-            previous_path = fields[1].strip()
-            path = fields[2].strip()
+            previous_path = decode_git_path(fields[1])
+            path = decode_git_path(fields[2])
+        elif raw_status.startswith("C"):
+            raise ValueError("copy status C<score> is not supported")
         else:
             raise ValueError("unsupported status; expected A, M, D, or R<score>")
+
+        if not path:
+            raise ValueError("file path must not be empty")
+        if status == "renamed" and not previous_path:
+            raise ValueError("previous file path must not be empty")
 
         label = _status_label(status)
         title = f"{label} {path}"
