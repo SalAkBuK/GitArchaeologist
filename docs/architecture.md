@@ -2,13 +2,13 @@
 
 ## Current State
 
-This project is currently a static Next.js UI mockup. The rendered investigation is not backed by API calls, persisted state, ingestion jobs, repository indexing, or a real evidence graph. Most domain data lives in `lib/investigation-data.ts`, while a few important values are embedded directly in components.
+This project now has one live vertical slice backed by FastAPI: Git-log upload, persisted commit and modified-file artifacts, a commit investigation endpoint, and a Next.js dashboard that loads real backend data. The preserved design fixture lives in `sample-data/investigation-001.json`.
 
-The immediate goal should be to preserve the current UI while replacing static structures with typed data contracts and API-backed loading states.
+The immediate goal is still narrow: keep the live commit investigation honest while adding missing deterministic evidence sources one at a time.
 
 ## Hardcoded Data Structures Currently Rendered
 
-### `lib/investigation-data.ts`
+### `sample-data/investigation-001.json`
 
 | Structure | Current role | Should become |
 | --- | --- | --- |
@@ -301,17 +301,13 @@ export interface FollowUpQuestion {
 }
 ```
 
-## Implementation Plan
+## Historical Implementation Plan
 
-### Phase 1 - Restructure without changing behavior
+The phased plan below predates the live commit-investigation slice and is retained only as design history. It is not current setup or execution guidance; use the root and backend READMEs for the implemented system.
 
-1. Move the existing Next.js UI into `frontend/`.
-2. Keep `backend/` empty except for future service scaffolding.
-3. Move current mock data into `sample-data/investigation-128.json`.
-4. Add shared TypeScript domain types in the frontend first.
-5. Replace direct imports from `lib/investigation-data.ts` with a thin data adapter that reads the sample JSON.
+### Phase 1 - Frontend normalization (completed)
 
-This phase should produce the same UI, but the UI should consume data shaped like the future API.
+The Next.js app remains at the repository root. Shared types live in `lib/domain.ts`, the preserved design fixture lives in `sample-data/investigation-001.json`, and fixture loading remains isolated in `lib/investigation-adapter.ts`. The active page now uses the FastAPI commit-investigation API instead of that fixture.
 
 ### Phase 2 - Normalize the mock data
 
@@ -339,7 +335,7 @@ This is the most important frontend step. If the sample data is normalized corre
 4. Store raw source payloads separately from normalized artifacts.
 5. Store model output with traceability: every summary claim should point back to artifact IDs and edge IDs.
 
-Do not build the backend before the data contract is stable. Otherwise the API will simply mirror the current mockup mistakes.
+This sequencing constraint has been satisfied for the current narrow contract: the implemented backend persists only Git commits and modified-file artifacts and returns explicit deterministic edges.
 
 ### Phase 5 - Real ingestion
 

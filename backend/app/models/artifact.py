@@ -23,7 +23,7 @@ class ArtifactModel(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     repository_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     source_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
-    external_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    external_id: Mapped[str] = mapped_column(String(255), nullable=False)
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     summary: Mapped[str] = mapped_column(Text, nullable=False)
     body: Mapped[str] = mapped_column(Text, nullable=False)

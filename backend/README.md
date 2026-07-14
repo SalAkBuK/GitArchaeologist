@@ -1,14 +1,14 @@
 # GitArchaeologist AI backend
 
-This backend implements the first ingestion slice only:
+The backend implements the deterministic commit-investigation slice:
 
-`git_log.txt -> deterministic Git parser -> normalized artifacts -> SQLite -> FastAPI`
+`git_log.txt -> parser -> commit/file artifacts -> SQLite -> FastAPI investigation response`
 
-It does not parse Jira, Slack, pull requests, build evidence edges, call an LLM, or integrate with the frontend.
+It does not ingest Issues, pull requests, Slack, Jira, or model-generated evidence.
 
-## Run locally
+## Install and run
 
-From `backend/`:
+From `backend/` on Windows:
 
 ```powershell
 python -m venv .venv
@@ -16,7 +16,9 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --reload
 ```
 
-The default database is `backend/git_archaeologist.db`. Set `DATABASE_URL` to override it.
+Use `.venv/bin/python` on Bash/Zsh. The default database is `backend/git_archaeologist.db`; `DATABASE_URL` can select a disposable SQLite file.
+
+From `backend/`, upload the tracked sample and query it with:
 
 ```powershell
 curl.exe -X POST http://127.0.0.1:8000/api/ingestions/git `
@@ -24,43 +26,62 @@ curl.exe -X POST http://127.0.0.1:8000/api/ingestions/git `
   -F "file=@../sample-data/git_log.txt;type=text/plain"
 
 curl.exe "http://127.0.0.1:8000/api/artifacts?repositoryId=acme%2Fplatform&sourceType=git_commit"
+
+curl.exe "http://127.0.0.1:8000/api/investigations/commits/1111111111111111111111111111111111111111?repositoryId=acme%2Fplatform"
 ```
 
-Run tests from `backend/`:
+Run tests from `backend/` with:
 
 ```powershell
-python -m pytest
+.\.venv\Scripts\python.exe -m pytest -p no:cacheprovider
 ```
 
-## Accepted Git log format
+## Generate accepted input
 
-Each record must use a full SHA-1 or SHA-256 hash, an author name/email, and a timezone-aware ISO 8601 date:
+Use Git's `--output` option instead of shell redirection. PowerShell 5.1 `>` writes UTF-16 and is intentionally rejected.
 
-```text
-commit <full hash>
-Author: Name <email@example.com>
-Date: 2026-07-14T10:30:00+05:00
-
-    Subject line
-    Optional multiline body
-```
-
-Generate compatible input with:
+PowerShell:
 
 ```powershell
-git log --date=iso-strict --pretty=format:'commit %H%nAuthor: %an <%ae>%nDate: %aI%n%n%B%n'
+git -c core.quotepath=false log `
+  --date=iso-strict `
+  --name-status `
+  --pretty=format:"commit %H%nAuthor: %an <%ae>%nDate: %aI%n%n%w(0,4,4)%B%n" `
+  --output=git_log.txt
 ```
 
-The parser handles records independently. `recordsParsed` counts successfully normalized records; `recordsRejected` and `validationErrors` describe malformed records. Valid records in a partially malformed upload are still inserted.
+Bash/Zsh:
 
-## Artifact contract
+```bash
+git -c core.quotepath=false log \
+  --date=iso-strict \
+  --name-status \
+  --pretty=format:'commit %H%nAuthor: %an <%ae>%nDate: %aI%n%n%w(0,4,4)%B%n' \
+  --output=git_log.txt
+```
 
-Database columns use snake_case. API responses use the camelCase names from `lib/domain.ts`. `author_name` and `author_email` are flattened in SQLite but returned as the TypeScript-compatible `author` object. A Git artifact has confidence `1.0` because the uploaded commit is direct evidence. Optional investigation, URL, detail, and confidence-level fields are omitted because ingestion cannot determine them honestly.
+The upload boundary accepts strict UTF-8 with an optional BOM. The parser normalizes LF, CRLF, and CR. It supports added (`A`), modified (`M`), deleted (`D`), and renamed (`R<score>`) records. Git C-style quoted paths are decoded strictly, including UTF-8 octal bytes. Copy records are rejected with a record-level validation error.
 
-IDs are UUIDv5 values derived from repository ID, `git_commit`, and the lowercase full commit hash. SQLite additionally enforces uniqueness across `(repository_id, source_type, external_id)`.
+Empty commit messages are valid. They retain an empty body and use `Commit <short-sha>` only as the display title.
 
-Ticket references and component mentions are extracted only by explicit regular expressions in `app/parsers/git_log.py`; no inferred tags are produced.
+## Snapshot reconciliation
 
-## Schema management tradeoff
+Each valid incoming commit record is authoritative for its repository and SHA. In one database transaction, ingestion:
 
-`Database.create_schema()` uses SQLAlchemy `create_all()` because this phase owns one table and targets local development. This does not safely evolve an existing database. Add a migration tool such as Alembic before changing a deployed or shared schema.
+1. Inserts a new commit or updates changed normalized commit content.
+2. Inserts newly present modified-file artifacts.
+3. Updates a same-identity file artifact when mutable metadata changes.
+4. Removes obsolete file artifacts for that commit only.
+5. Leaves other commits and repositories untouched.
+
+The response preserves `recordsInserted` and `recordsSkippedAsDuplicates`, and adds `recordsUpdated` and `recordsDeleted`. Rejected parser records remain in `validationErrors`. A reconciliation failure rolls the transaction back.
+
+## Contracts and limits
+
+Repository-specific endpoints require a trimmed, non-empty `repositoryId` of at most 255 characters. Investigations require a full 40- or 64-character hexadecimal SHA. Uploads require a `.txt` filename, are limited to 5 MiB, and never write the uploaded filename or file contents to the local filesystem.
+
+Artifacts use deterministic UUIDv5 IDs scoped by repository. Modified files store `commitHash`, `path`, `previousPath`, `changeStatus`, and `rawStatus`. Investigation edges are generated from that persisted metadata at read time.
+
+`Database.create_schema()` uses `create_all()` for local development. It creates fresh tables but is not a migration system. The current slice remains compatible with the earlier SQLite table because generated external IDs fit its existing column declaration.
+
+The service trusts local users and permits only `localhost:3000` and `127.0.0.1:3000` browser origins. It has no authentication and must not be exposed as a public multi-tenant API.

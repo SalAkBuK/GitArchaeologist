@@ -17,7 +17,7 @@ class ActorRef(BaseModel):
 class ArtifactCreate(BaseModel):
     id: str
     repository_id: str
-    source_type: Literal["git_commit"] = "git_commit"
+    source_type: Literal["git_commit", "modified_file"] = "git_commit"
     external_id: str
     title: str
     summary: str
@@ -35,7 +35,7 @@ class ArtifactRead(BaseModel):
 
     id: str
     repository_id: str = Field(alias="repositoryId")
-    source_type: Literal["git_commit"] = Field(alias="sourceType")
+    source_type: Literal["git_commit", "modified_file"] = Field(alias="sourceType")
     external_id: str = Field(alias="externalId")
     title: str
     summary: str

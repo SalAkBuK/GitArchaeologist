@@ -3,6 +3,7 @@ export type ArtifactSourceType =
   | 'jira_ticket'
   | 'github_pull_request'
   | 'git_commit'
+  | 'modified_file'
   | 'deployment'
   | 'service'
   | 'metric'
@@ -47,6 +48,7 @@ export type EvidenceRelationType =
   | 'mentions'
   | 'correlates_with'
   | 'contradicts'
+  | 'modifies'
 
 export interface EvidenceEdge {
   id: string
