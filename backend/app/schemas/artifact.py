@@ -10,14 +10,16 @@ class ActorRef(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     display_name: str = Field(alias="displayName")
-    email: str
-    provider: Literal["git"] = "git"
+    email: str | None = None
+    provider: Literal["git", "github"] = "git"
 
 
 class ArtifactCreate(BaseModel):
     id: str
     repository_id: str
-    source_type: Literal["git_commit", "modified_file"] = "git_commit"
+    source_type: Literal["git_commit", "modified_file", "github_pull_request"] = (
+        "git_commit"
+    )
     external_id: str
     title: str
     summary: str
@@ -35,7 +37,9 @@ class ArtifactRead(BaseModel):
 
     id: str
     repository_id: str = Field(alias="repositoryId")
-    source_type: Literal["git_commit", "modified_file"] = Field(alias="sourceType")
+    source_type: Literal["git_commit", "modified_file", "github_pull_request"] = Field(
+        alias="sourceType"
+    )
     external_id: str = Field(alias="externalId")
     title: str
     summary: str

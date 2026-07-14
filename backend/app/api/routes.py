@@ -9,10 +9,13 @@ from sqlalchemy.orm import Session
 from app.database.session import get_db
 from app.repositories.artifacts import ArtifactRepository
 from app.parsers.git_log import FULL_HASH_RE
+from app.parsers.pull_request_fixture import PullRequestFixtureFormatError
 from app.schemas.artifact import ArtifactRead
 from app.schemas.ingestion import IngestionResult
 from app.schemas.investigation import CommitInvestigationRead
+from app.schemas.pull_request import PullRequestIngestionResult
 from app.services.git_ingestion import GitIngestionService
+from app.services.pull_request_ingestion import PullRequestIngestionService
 
 
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
@@ -34,13 +37,13 @@ def _normalize_repository_id(repository_id: str) -> str:
     return normalized
 
 
-def _decode_git_log(raw_content: bytes) -> str:
+def _decode_utf8_upload(raw_content: bytes, *, upload_type: str) -> str:
     if raw_content.startswith((b"\xff\xfe", b"\xfe\xff")):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
-                "UTF-16 Git logs are not supported. Generate UTF-8 input directly "
-                "with git log --output=git_log.txt."
+                f"UTF-16 {upload_type} files are not supported. "
+                "Provide UTF-8 or UTF-8 with BOM."
             ),
         )
     try:
@@ -48,7 +51,7 @@ def _decode_git_log(raw_content: bytes) -> str:
     except UnicodeDecodeError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Git log file must be valid UTF-8 or UTF-8 with BOM",
+            detail=f"{upload_type} file must be valid UTF-8 or UTF-8 with BOM",
         ) from exc
 
 
@@ -83,9 +86,49 @@ async def ingest_git_log(
             status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail=f"Git log file exceeds the {MAX_UPLOAD_BYTES}-byte limit",
         )
-    content = _decode_git_log(raw_content)
+    content = _decode_utf8_upload(raw_content, upload_type="Git log")
 
     return GitIngestionService(session).ingest(normalized_repository_id, content)
+
+
+@router.post(
+    "/api/ingestions/github/pull-requests",
+    response_model=PullRequestIngestionResult,
+    response_model_by_alias=True,
+)
+async def ingest_pull_request_fixture(
+    repository_id: Annotated[
+        str,
+        Form(alias="repositoryId", min_length=1, max_length=MAX_REPOSITORY_ID_LENGTH),
+    ],
+    file: Annotated[UploadFile, File()],
+    session: Annotated[Session, Depends(get_db)],
+) -> PullRequestIngestionResult:
+    normalized_repository_id = _normalize_repository_id(repository_id)
+    if not file.filename or not file.filename.lower().endswith(".json"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="A .json pull request fixture is required",
+        )
+
+    raw_content = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(raw_content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail=f"Pull request fixture exceeds the {MAX_UPLOAD_BYTES}-byte limit",
+        )
+    content = _decode_utf8_upload(raw_content, upload_type="Pull request fixture")
+
+    try:
+        return PullRequestIngestionService(session).ingest(
+            normalized_repository_id,
+            content,
+        )
+    except PullRequestFixtureFormatError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
+        ) from exc
 
 
 @router.get(
@@ -100,7 +143,7 @@ def list_artifacts(
         Query(alias="repositoryId", min_length=1, max_length=MAX_REPOSITORY_ID_LENGTH),
     ],
     source_type: Annotated[
-        Literal["git_commit", "modified_file"] | None,
+        Literal["git_commit", "modified_file", "github_pull_request"] | None,
         Query(alias="sourceType"),
     ] = None,
 ) -> list[ArtifactRead]:
