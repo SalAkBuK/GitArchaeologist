@@ -1,12 +1,33 @@
 import type { Artifact } from '@/lib/domain'
 
+export const MAX_PULL_REQUEST_FIXTURE_BYTES = 5 * 1024 * 1024
+export const PULL_REQUEST_FIXTURE_ACCEPT = '.json,application/json'
+
 export type ModifiedFileStatus = 'added' | 'modified' | 'deleted' | 'renamed'
+export type PullRequestState = 'open' | 'closed' | 'merged'
+
+export interface PullRequestEvidence {
+  id: string
+  repositoryId: string
+  number: number
+  title: string
+  body: string | null
+  state: PullRequestState
+  author: { login: string }
+  createdAt: string
+  updatedAt: string
+  mergedAt: string | null
+  url: string | null
+  baseBranch: string
+  headBranch: string
+  commitShas: string[]
+}
 
 export interface EvidenceEdge {
   id: string
   fromArtifactId: string
   toArtifactId: string
-  relationType: 'modifies'
+  relationType: 'contains' | 'modifies'
   label: string
   explanation: string
   confidence: number
@@ -22,23 +43,39 @@ export interface EvidenceStatus {
 
 export type MissingContextCode =
   | 'missing_pull_request'
+  | 'missing_pull_request_body'
   | 'missing_issue'
   | 'missing_human_rationale'
   | 'missing_modified_files'
+  | 'unresolved_pull_request_commit'
 
 export interface MissingContextWarning {
   code: MissingContextCode
   message: string
 }
 
+export interface UnresolvedCommitReference {
+  pullRequestId: string
+  pullRequestNumber: number
+  commitSha: string
+}
+
 export interface CommitInvestigation {
   repositoryId: string
   commitSha: string
   selectedCommit: Artifact
+  linkedPullRequests: PullRequestEvidence[]
   modifiedFiles: Artifact[]
   evidenceEdges: EvidenceEdge[]
   evidenceStatus: EvidenceStatus[]
   missingContextWarnings: MissingContextWarning[]
+  unresolvedCommitReferences: UnresolvedCommitReference[]
+}
+
+export interface IngestionValidationError {
+  recordNumber: number
+  message: string
+  externalId: string | null
 }
 
 export interface IngestionResult {
@@ -47,20 +84,38 @@ export interface IngestionResult {
   recordsDeleted: number
   recordsSkippedAsDuplicates: number
   recordsRejected: number
-  validationErrors: Array<{
-    recordNumber: number
-    message: string
-    externalId: string | null
-  }>
+  validationErrors: IngestionValidationError[]
+}
+
+export interface PullRequestIngestionResult {
+  repositoryId: string
+  recordsReceived: number
+  recordsInserted: number
+  recordsUpdated: number
+  recordsSkippedAsDuplicates: number
+  recordsRejected: number
+  explicitCommitReferencesResolved: number
+  explicitCommitReferencesUnresolved: number
+  validationErrors: IngestionValidationError[]
 }
 
 export class ApiResponseError extends Error {
-  constructor(
-    readonly status: number,
-    message: string,
-  ) {
+  readonly status: number
+
+  constructor(status: number, message: string) {
     super(message)
     this.name = 'ApiResponseError'
+    this.status = status
+  }
+}
+
+export class PullRequestFixtureClientError extends Error {
+  readonly code: 'wrong_extension' | 'file_too_large'
+
+  constructor(code: 'wrong_extension' | 'file_too_large', message: string) {
+    super(message)
+    this.name = 'PullRequestFixtureClientError'
+    this.code = code
   }
 }
 
@@ -70,6 +125,33 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === 'string')
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return Number.isInteger(value) && Number(value) >= 0
+}
+
+function isTimestamp(value: unknown): value is string {
+  return typeof value === 'string' && !Number.isNaN(Date.parse(value))
+}
+
+function isNullableTimestamp(value: unknown): value is string | null {
+  return value === null || isTimestamp(value)
+}
+
+function isNullableAbsoluteHttpUrl(value: unknown): value is string | null {
+  if (value === null) return true
+  if (typeof value !== 'string') return false
+  try {
+    const url = new URL(value)
+    return url.protocol === 'http:' || url.protocol === 'https:'
+  } catch {
+    return false
+  }
+}
+
+function isFullCommitSha(value: unknown): value is string {
+  return typeof value === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value)
 }
 
 function isArtifact(value: unknown): value is Artifact {
@@ -85,10 +167,8 @@ function isArtifact(value: unknown): value is Artifact {
     typeof value.summary === 'string' &&
     typeof value.body === 'string' &&
     typeof value.author.displayName === 'string' &&
-    typeof value.occurredAt === 'string' &&
-    !Number.isNaN(Date.parse(value.occurredAt)) &&
-    typeof value.ingestedAt === 'string' &&
-    !Number.isNaN(Date.parse(value.ingestedAt)) &&
+    isTimestamp(value.occurredAt) &&
+    isTimestamp(value.ingestedAt) &&
     typeof value.confidence === 'number' &&
     isStringArray(value.tags)
   )
@@ -111,13 +191,35 @@ function isModifiedFileArtifact(value: unknown): value is Artifact {
   )
 }
 
+function isPullRequestEvidence(value: unknown): value is PullRequestEvidence {
+  if (!isRecord(value) || !isRecord(value.author)) return false
+  return (
+    typeof value.id === 'string' &&
+    typeof value.repositoryId === 'string' &&
+    Number.isInteger(value.number) &&
+    Number(value.number) > 0 &&
+    typeof value.title === 'string' &&
+    (value.body === null || typeof value.body === 'string') &&
+    (value.state === 'open' || value.state === 'closed' || value.state === 'merged') &&
+    typeof value.author.login === 'string' &&
+    isTimestamp(value.createdAt) &&
+    isTimestamp(value.updatedAt) &&
+    isNullableTimestamp(value.mergedAt) &&
+    isNullableAbsoluteHttpUrl(value.url) &&
+    typeof value.baseBranch === 'string' &&
+    typeof value.headBranch === 'string' &&
+    Array.isArray(value.commitShas) &&
+    value.commitShas.every(isFullCommitSha)
+  )
+}
+
 function isEvidenceEdge(value: unknown): value is EvidenceEdge {
   return (
     isRecord(value) &&
     typeof value.id === 'string' &&
     typeof value.fromArtifactId === 'string' &&
     typeof value.toArtifactId === 'string' &&
-    value.relationType === 'modifies' &&
+    (value.relationType === 'contains' || value.relationType === 'modifies') &&
     typeof value.label === 'string' &&
     typeof value.explanation === 'string' &&
     typeof value.confidence === 'number' &&
@@ -138,9 +240,11 @@ function isEvidenceStatus(value: unknown): value is EvidenceStatus {
 function isMissingContextWarning(value: unknown): value is MissingContextWarning {
   const codes: MissingContextCode[] = [
     'missing_pull_request',
+    'missing_pull_request_body',
     'missing_issue',
     'missing_human_rationale',
     'missing_modified_files',
+    'unresolved_pull_request_commit',
   ]
   return (
     isRecord(value) &&
@@ -148,6 +252,39 @@ function isMissingContextWarning(value: unknown): value is MissingContextWarning
     codes.includes(value.code as MissingContextCode) &&
     typeof value.message === 'string'
   )
+}
+
+function isUnresolvedCommitReference(value: unknown): value is UnresolvedCommitReference {
+  return (
+    isRecord(value) &&
+    typeof value.pullRequestId === 'string' &&
+    Number.isInteger(value.pullRequestNumber) &&
+    Number(value.pullRequestNumber) > 0 &&
+    isFullCommitSha(value.commitSha)
+  )
+}
+
+function parseValidationErrors(value: unknown): IngestionValidationError[] {
+  if (
+    !Array.isArray(value) ||
+    !value.every(
+      (item) =>
+        isRecord(item) &&
+        Number.isInteger(item.recordNumber) &&
+        Number(item.recordNumber) > 0 &&
+        typeof item.message === 'string' &&
+        (item.externalId === null ||
+          item.externalId === undefined ||
+          typeof item.externalId === 'string'),
+    )
+  ) {
+    throw new Error('Backend returned invalid ingestion validation errors')
+  }
+  return value.map((item) => ({
+    recordNumber: item.recordNumber as number,
+    message: item.message as string,
+    externalId: typeof item.externalId === 'string' ? item.externalId : null,
+  }))
 }
 
 export function parseArtifactList(value: unknown): Artifact[] {
@@ -165,15 +302,19 @@ export function parseCommitInvestigation(value: unknown): CommitInvestigation {
     throw new Error('Backend returned an invalid commit investigation')
   }
   const selectedCommit = value.selectedCommit
+  const linkedPullRequests = value.linkedPullRequests
   const modifiedFiles = value.modifiedFiles
   const evidenceEdges = value.evidenceEdges
   const evidenceStatus = value.evidenceStatus
   const missingContextWarnings = value.missingContextWarnings
+  const unresolvedCommitReferences = value.unresolvedCommitReferences
   if (
     typeof value.repositoryId !== 'string' ||
-    typeof value.commitSha !== 'string' ||
+    !isFullCommitSha(value.commitSha) ||
     !isArtifact(selectedCommit) ||
     selectedCommit.sourceType !== 'git_commit' ||
+    !Array.isArray(linkedPullRequests) ||
+    !linkedPullRequests.every(isPullRequestEvidence) ||
     !Array.isArray(modifiedFiles) ||
     !modifiedFiles.every(isModifiedFileArtifact) ||
     !Array.isArray(evidenceEdges) ||
@@ -181,23 +322,37 @@ export function parseCommitInvestigation(value: unknown): CommitInvestigation {
     !Array.isArray(evidenceStatus) ||
     !evidenceStatus.every(isEvidenceStatus) ||
     !Array.isArray(missingContextWarnings) ||
-    !missingContextWarnings.every(isMissingContextWarning)
+    !missingContextWarnings.every(isMissingContextWarning) ||
+    !Array.isArray(unresolvedCommitReferences) ||
+    !unresolvedCommitReferences.every(isUnresolvedCommitReference)
   ) {
     throw new Error('Backend returned an invalid commit investigation')
   }
 
+  const pullRequestIds = new Set(linkedPullRequests.map((item) => item.id))
   const fileIds = new Set(modifiedFiles.map((artifact) => artifact.id))
+  const edgeIds = new Set(evidenceEdges.map((edge) => edge.id))
+  const artifactIds = new Set([selectedCommit.id, ...pullRequestIds, ...fileIds])
   if (
     selectedCommit.repositoryId !== value.repositoryId ||
     selectedCommit.externalId !== value.commitSha ||
+    linkedPullRequests.some((item) => item.repositoryId !== value.repositoryId) ||
     modifiedFiles.some(
       (artifact) =>
         artifact.repositoryId !== value.repositoryId ||
         artifact.metadata.commitHash !== value.commitSha,
     ) ||
-    evidenceEdges.some(
-      (edge) => edge.fromArtifactId !== selectedCommit.id || !fileIds.has(edge.toArtifactId),
-    )
+    evidenceEdges.some((edge) =>
+      edge.relationType === 'contains'
+        ? !pullRequestIds.has(edge.fromArtifactId) || edge.toArtifactId !== selectedCommit.id
+        : edge.fromArtifactId !== selectedCommit.id || !fileIds.has(edge.toArtifactId),
+    ) ||
+    evidenceStatus.some(
+      (status) =>
+        status.artifactIds.some((id) => !artifactIds.has(id)) ||
+        status.edgeIds.some((id) => !edgeIds.has(id)),
+    ) ||
+    unresolvedCommitReferences.some((reference) => !pullRequestIds.has(reference.pullRequestId))
   ) {
     throw new Error('Backend returned inconsistent investigation relationships')
   }
@@ -206,10 +361,12 @@ export function parseCommitInvestigation(value: unknown): CommitInvestigation {
     repositoryId: value.repositoryId,
     commitSha: value.commitSha,
     selectedCommit,
+    linkedPullRequests,
     modifiedFiles,
     evidenceEdges,
     evidenceStatus,
     missingContextWarnings,
+    unresolvedCommitReferences,
   }
 }
 
@@ -224,22 +381,150 @@ export function parseIngestionResult(value: unknown): IngestionResult {
     'recordsSkippedAsDuplicates',
     'recordsRejected',
   ] as const
-  if (numberFields.some((field) => !Number.isInteger(value[field]) || Number(value[field]) < 0)) {
+  if (numberFields.some((field) => !isNonNegativeInteger(value[field]))) {
     throw new Error('Backend returned invalid ingestion counts')
   }
-  if (
-    !Array.isArray(value.validationErrors) ||
-    !value.validationErrors.every(
-      (item) =>
-        isRecord(item) &&
-        Number.isInteger(item.recordNumber) &&
-        typeof item.message === 'string' &&
-        (item.externalId === null || item.externalId === undefined || typeof item.externalId === 'string'),
-    )
-  ) {
-    throw new Error('Backend returned invalid ingestion validation errors')
+  return {
+    recordsInserted: value.recordsInserted as number,
+    recordsUpdated: value.recordsUpdated as number,
+    recordsDeleted: value.recordsDeleted as number,
+    recordsSkippedAsDuplicates: value.recordsSkippedAsDuplicates as number,
+    recordsRejected: value.recordsRejected as number,
+    validationErrors: parseValidationErrors(value.validationErrors),
   }
-  return value as unknown as IngestionResult
+}
+
+export function parsePullRequestIngestionResult(value: unknown): PullRequestIngestionResult {
+  if (!isRecord(value) || typeof value.repositoryId !== 'string') {
+    throw new Error('Backend returned an invalid pull request ingestion result')
+  }
+  const numberFields = [
+    'recordsReceived',
+    'recordsInserted',
+    'recordsUpdated',
+    'recordsSkippedAsDuplicates',
+    'recordsRejected',
+    'explicitCommitReferencesResolved',
+    'explicitCommitReferencesUnresolved',
+  ] as const
+  if (numberFields.some((field) => !isNonNegativeInteger(value[field]))) {
+    throw new Error('Backend returned invalid pull request ingestion counts')
+  }
+  if (Number(value.recordsRejected) > Number(value.recordsReceived)) {
+    throw new Error('Backend returned inconsistent pull request ingestion counts')
+  }
+  return {
+    repositoryId: value.repositoryId,
+    recordsReceived: value.recordsReceived as number,
+    recordsInserted: value.recordsInserted as number,
+    recordsUpdated: value.recordsUpdated as number,
+    recordsSkippedAsDuplicates: value.recordsSkippedAsDuplicates as number,
+    recordsRejected: value.recordsRejected as number,
+    explicitCommitReferencesResolved: value.explicitCommitReferencesResolved as number,
+    explicitCommitReferencesUnresolved: value.explicitCommitReferencesUnresolved as number,
+    validationErrors: parseValidationErrors(value.validationErrors),
+  }
+}
+
+export function validatePullRequestFixtureFile(file: Pick<File, 'name' | 'size'>): void {
+  if (!file.name.toLowerCase().endsWith('.json')) {
+    throw new PullRequestFixtureClientError(
+      'wrong_extension',
+      'Choose a pull request fixture with a .json extension.',
+    )
+  }
+  if (file.size > MAX_PULL_REQUEST_FIXTURE_BYTES) {
+    throw new PullRequestFixtureClientError(
+      'file_too_large',
+      'Pull request fixture exceeds the 5 MiB upload limit.',
+    )
+  }
+}
+
+export async function uploadPullRequestFixture(options: {
+  apiBaseUrl: string
+  repositoryId: string
+  file: File
+  signal?: AbortSignal
+  fetchImplementation?: typeof fetch
+}): Promise<PullRequestIngestionResult> {
+  validatePullRequestFixtureFile(options.file)
+  const payload = new FormData()
+  payload.append('repositoryId', options.repositoryId)
+  payload.append('file', options.file)
+  const response = await (options.fetchImplementation ?? fetch)(
+    `${options.apiBaseUrl}/api/ingestions/github/pull-requests`,
+    {
+      method: 'POST',
+      body: payload,
+      signal: options.signal,
+    },
+  )
+  if (!response.ok) {
+    throw await apiErrorFromResponse(response)
+  }
+  const result = parsePullRequestIngestionResult(await response.json())
+  if (result.repositoryId !== options.repositoryId) {
+    throw new Error('Backend returned a pull request ingestion result for another repository')
+  }
+  return result
+}
+
+export function pullRequestIngestionSummary(
+  result: PullRequestIngestionResult,
+): string[] {
+  const lines = [
+    `Received ${result.recordsReceived}; accepted ${result.recordsReceived - result.recordsRejected}; rejected ${result.recordsRejected}.`,
+    `Inserted ${result.recordsInserted}; updated ${result.recordsUpdated}; unchanged ${result.recordsSkippedAsDuplicates}.`,
+    `References resolved ${result.explicitCommitReferencesResolved}; unresolved ${result.explicitCommitReferencesUnresolved}.`,
+  ]
+  if (result.recordsRejected > 0) {
+    lines.push(
+      `Rejected ${result.recordsRejected} total; showing ${result.validationErrors.length} validation details.`,
+    )
+  }
+  return lines
+}
+
+export interface PullRequestUploadRunner {
+  isActive(): boolean
+  cancel(): void
+  run(
+    task: () => Promise<PullRequestIngestionResult>,
+    onSuccess: (result: PullRequestIngestionResult) => void | Promise<void>,
+  ): Promise<{ started: boolean; result?: PullRequestIngestionResult }>
+}
+
+export function createPullRequestUploadRunner(
+  onLoadingChange: (loading: boolean) => void,
+): PullRequestUploadRunner {
+  let active = false
+  let generation = 0
+  return {
+    isActive: () => active,
+    cancel() {
+      generation += 1
+      active = false
+      onLoadingChange(false)
+    },
+    async run(task, onSuccess) {
+      if (active) return { started: false }
+      active = true
+      const requestGeneration = ++generation
+      onLoadingChange(true)
+      try {
+        const result = await task()
+        if (requestGeneration !== generation) return { started: true }
+        await onSuccess(result)
+        return { started: true, result }
+      } finally {
+        if (requestGeneration === generation) {
+          active = false
+          onLoadingChange(false)
+        }
+      }
+    },
+  }
 }
 
 export async function apiErrorFromResponse(response: Response): Promise<ApiResponseError> {

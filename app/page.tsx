@@ -7,6 +7,8 @@ import {
   FileCode2,
   GitBranch,
   GitCommitVertical,
+  GitPullRequest,
+  ExternalLink,
   Network,
   RefreshCw,
   Upload,
@@ -14,12 +16,19 @@ import {
 import type { Artifact } from '@/lib/domain'
 import {
   ApiResponseError,
+  PULL_REQUEST_FIXTURE_ACCEPT,
+  PullRequestFixtureClientError,
   apiErrorFromResponse,
+  createPullRequestUploadRunner,
   parseArtifactList,
   parseCommitInvestigation,
   parseIngestionResult,
+  pullRequestIngestionSummary,
+  uploadPullRequestFixture,
   type CommitInvestigation,
   type MissingContextWarning,
+  type PullRequestIngestionResult,
+  type PullRequestUploadRunner,
 } from '@/lib/live-api'
 
 interface ApplicationError {
@@ -88,13 +97,38 @@ function presentError(error: unknown, operation: 'list' | 'investigation' | 'upl
   }
 }
 
+function presentPullRequestUploadError(error: unknown): ApplicationError {
+  if (error instanceof PullRequestFixtureClientError) {
+    return {
+      title: error.code === 'wrong_extension' ? 'Wrong file type' : 'Fixture too large',
+      message: error.message,
+    }
+  }
+  if (error instanceof ApiResponseError) {
+    const message = error.message.toLowerCase()
+    if (error.status === 413) return { title: 'Fixture too large', message: error.message }
+    if (message.includes('repositoryid') && message.includes('match')) {
+      return { title: 'Repository mismatch', message: error.message }
+    }
+    if (message.includes('utf-8') || message.includes('utf-16')) {
+      return { title: 'Unsupported encoding', message: error.message }
+    }
+    if (message.includes('malformed json')) return { title: 'Malformed JSON', message: error.message }
+    if (error.status === 400 || error.status === 422) {
+      return { title: 'Invalid pull request fixture', message: error.message }
+    }
+    return { title: 'Backend request failed', message: error.message }
+  }
+  return presentError(error, 'upload')
+}
+
 function MissingContextList({ warnings }: { warnings: MissingContextWarning[] }) {
   return (
     <ul className="flex flex-col gap-3">
       {warnings.map((warning) => (
         <li key={warning.code} className="rounded-xl border border-border bg-card p-3">
           <p className="font-mono text-[10px] uppercase tracking-widest text-primary">
-            {warning.code.replaceAll('_', ' ')}
+            {warning.code}
           </p>
           <p className="mt-2 text-sm leading-relaxed text-muted-foreground">{warning.message}</p>
         </li>
@@ -114,9 +148,20 @@ export default function Page() {
   const [notFound, setNotFound] = useState(false)
   const [uploadMessage, setUploadMessage] = useState<string | null>(null)
   const [uploading, setUploading] = useState(false)
+  const [pullRequestUploading, setPullRequestUploading] = useState(false)
+  const [pullRequestUploadResult, setPullRequestUploadResult] =
+    useState<PullRequestIngestionResult | null>(null)
+  const [pullRequestUploadError, setPullRequestUploadError] =
+    useState<ApplicationError | null>(null)
+  const [investigationRevision, setInvestigationRevision] = useState(0)
   const commitListController = useRef<AbortController | null>(null)
   const investigationController = useRef<AbortController | null>(null)
   const uploadController = useRef<AbortController | null>(null)
+  const pullRequestUploadController = useRef<AbortController | null>(null)
+  const pullRequestUploadRunner = useRef<PullRequestUploadRunner | null>(null)
+  if (pullRequestUploadRunner.current === null) {
+    pullRequestUploadRunner.current = createPullRequestUploadRunner(setPullRequestUploading)
+  }
   const commitListRequestId = useRef(0)
   const investigationRequestId = useRef(0)
   const uploadRequestId = useRef(0)
@@ -239,7 +284,7 @@ export default function Page() {
     return () => {
       controller.abort()
     }
-  }, [normalizedRepositoryId, selectedSha])
+  }, [investigationRevision, normalizedRepositoryId, selectedSha])
 
   const selectedCommit = useMemo(
     () => commits.find((commit) => commit.externalId === selectedSha),
@@ -250,6 +295,8 @@ export default function Page() {
     commitListController.current?.abort()
     investigationController.current?.abort()
     uploadController.current?.abort()
+    pullRequestUploadController.current?.abort()
+    pullRequestUploadRunner.current?.cancel()
     commitListRequestId.current += 1
     investigationRequestId.current += 1
     uploadRequestId.current += 1
@@ -260,6 +307,8 @@ export default function Page() {
     setLoadingCommits(false)
     setLoadingInvestigation(false)
     setUploading(false)
+    setPullRequestUploadResult(null)
+    setPullRequestUploadError(null)
     setApplicationError(null)
     setUploadMessage(null)
     setRepositoryId(event.target.value)
@@ -361,6 +410,48 @@ export default function Page() {
     }
   }
 
+  async function handlePullRequestUpload(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const form = event.currentTarget
+    const input = form.elements.namedItem('pullRequestFixture') as HTMLInputElement | null
+    const file = input?.files?.[0]
+    if (!file || !normalizedRepositoryId) {
+      setPullRequestUploadError({
+        title: 'Fixture required',
+        message: 'Choose a pull request JSON fixture and repository ID first.',
+      })
+      return
+    }
+
+    const targetRepositoryId = normalizedRepositoryId
+    setPullRequestUploadError(null)
+    setPullRequestUploadResult(null)
+    try {
+      await pullRequestUploadRunner.current?.run(
+        async () => {
+          const controller = new AbortController()
+          pullRequestUploadController.current = controller
+          return uploadPullRequestFixture({
+            apiBaseUrl: API_BASE_URL,
+            repositoryId: targetRepositoryId,
+            file,
+            signal: controller.signal,
+          })
+        },
+        (result) => {
+          if (activeRepositoryId.current !== targetRepositoryId) return
+          setPullRequestUploadResult(result)
+          form.reset()
+          setInvestigationRevision((revision) => revision + 1)
+        },
+      )
+    } catch (error) {
+      if (!isAbortError(error) && activeRepositoryId.current === targetRepositoryId) {
+        setPullRequestUploadError(presentPullRequestUploadError(error))
+      }
+    }
+  }
+
   return (
     <div className="flex h-dvh flex-col overflow-hidden bg-background">
       <header className="flex items-center justify-between gap-4 border-b border-border bg-background/70 px-4 py-3 backdrop-blur">
@@ -419,6 +510,66 @@ export default function Page() {
                 </p>
               )}
             </form>
+
+            <details className="rounded-xl border border-border bg-card p-3">
+              <summary className="flex cursor-pointer list-none items-center gap-2">
+                <GitPullRequest className="size-4 text-primary" aria-hidden="true" />
+                <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+                  Advanced: PR Fixture
+                </p>
+              </summary>
+              <form onSubmit={handlePullRequestUpload} className="mt-3 border-t border-border pt-3">
+                <input
+                  name="pullRequestFixture"
+                  type="file"
+                  accept={PULL_REQUEST_FIXTURE_ACCEPT}
+                  disabled={pullRequestUploading}
+                  className="w-full text-xs text-muted-foreground file:mr-3 file:rounded-md file:border-0 file:bg-secondary file:px-2 file:py-1.5 file:text-xs file:text-foreground disabled:opacity-50"
+                />
+                <button
+                  type="submit"
+                  disabled={pullRequestUploading}
+                  className="mt-3 flex w-full items-center justify-center gap-2 rounded-lg bg-primary px-3 py-2 text-sm font-medium text-primary-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <Upload className="size-4" aria-hidden="true" />
+                  {pullRequestUploading ? 'Uploading fixture' : 'Upload PR fixture'}
+                </button>
+
+                {pullRequestUploadError && (
+                  <div className="mt-3 rounded-lg border border-destructive/40 bg-destructive/10 p-2.5">
+                    <p className="text-xs font-medium text-destructive">
+                      {pullRequestUploadError.title}
+                    </p>
+                    <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                      {pullRequestUploadError.message}
+                    </p>
+                  </div>
+                )}
+
+                {pullRequestUploadResult && (
+                  <div className="mt-3 space-y-1 border-t border-border pt-3 font-mono text-[11px] text-muted-foreground">
+                    {pullRequestIngestionSummary(pullRequestUploadResult).map((line) => (
+                      <p key={line}>{line}</p>
+                    ))}
+                    {pullRequestUploadResult.recordsRejected > 0 && (
+                      <div className="pt-2 font-sans">
+                        <ul className="mt-2 max-h-40 space-y-2 overflow-y-auto pr-1">
+                          {pullRequestUploadResult.validationErrors.map((error) => (
+                            <li
+                              key={`${error.recordNumber}:${error.externalId ?? ''}:${error.message}`}
+                              className="rounded-md border border-border bg-background/40 p-2 text-xs"
+                            >
+                              <span className="font-mono text-primary">Record {error.recordNumber}</span>{' '}
+                              <span className="text-muted-foreground">{error.message}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </form>
+            </details>
 
             <div>
               <div className="mb-2 flex items-center justify-between">
@@ -556,6 +707,55 @@ export default function Page() {
                   </div>
                 </section>
 
+                {investigation.linkedPullRequests.length > 0 && (
+                  <section className="rounded-2xl border border-border bg-card p-5">
+                    <div className="flex items-center gap-2">
+                      <GitPullRequest className="size-4 text-primary" aria-hidden="true" />
+                      <h2 className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
+                        Linked Pull Requests
+                      </h2>
+                    </div>
+                    <ul className="mt-4 flex flex-col gap-3">
+                      {investigation.linkedPullRequests.map((pullRequest) => (
+                        <li key={pullRequest.id} className="rounded-xl border border-border p-4">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="font-mono text-xs text-primary">
+                              PR #{pullRequest.number}
+                            </span>
+                            <span className="rounded-md bg-secondary px-2 py-0.5 font-mono text-[10px] uppercase text-muted-foreground">
+                              {pullRequest.state}
+                            </span>
+                            {pullRequest.url && (
+                              <a
+                                href={pullRequest.url}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="ml-auto inline-flex items-center gap-1 text-xs text-primary hover:underline"
+                              >
+                                Open source
+                                <ExternalLink className="size-3" aria-hidden="true" />
+                              </a>
+                            )}
+                          </div>
+                          <h3 className="mt-2 text-sm font-semibold">{pullRequest.title}</h3>
+                          <p className="mt-1 text-xs text-muted-foreground">
+                            {pullRequest.author.login} -{' '}
+                            {formatDate(pullRequest.mergedAt ?? pullRequest.createdAt)}
+                          </p>
+                          <p className="mt-3 whitespace-pre-wrap text-sm leading-relaxed text-foreground/85">
+                            {pullRequest.body?.trim()
+                              ? pullRequest.body
+                              : 'No pull request description was imported.'}
+                          </p>
+                          <p className="mt-3 font-mono text-[11px] text-muted-foreground">
+                            Explicitly contains commit {shortSha(investigation.commitSha)}
+                          </p>
+                        </li>
+                      ))}
+                    </ul>
+                  </section>
+                )}
+
                 <section className="rounded-2xl border border-border bg-card p-5">
                   <div className="flex items-center gap-2">
                     <CheckCircle2 className="size-4 text-primary" aria-hidden="true" />
@@ -614,25 +814,30 @@ export default function Page() {
                   </div>
                   {investigation.evidenceEdges.length === 0 ? (
                     <p className="mt-4 rounded-lg border border-dashed border-border p-4 text-sm text-muted-foreground">
-                      No commit-to-file edges exist because no file records were ingested.
+                      No explicit evidence edges exist for this commit.
                     </p>
                   ) : (
                     <ul className="mt-4 flex flex-col gap-2">
-                      {investigation.evidenceEdges.map((edge) => (
-                        <li key={edge.id} className="rounded-lg border border-border p-3">
-                          <p className="text-sm font-medium">
-                            {shortSha(investigation.commitSha)} modifies{' '}
-                            {filePath(
-                              investigation.modifiedFiles.find(
-                                (fileArtifact) => fileArtifact.id === edge.toArtifactId,
-                              ) ?? investigation.modifiedFiles[0],
-                            )}
-                          </p>
-                          <p className="mt-1 text-xs text-muted-foreground">
-                            {edge.explanation}
-                          </p>
-                        </li>
-                      ))}
+                      {investigation.evidenceEdges.map((edge) => {
+                        const pullRequest = investigation.linkedPullRequests.find(
+                          (item) => item.id === edge.fromArtifactId,
+                        )
+                        const modifiedFile = investigation.modifiedFiles.find(
+                          (item) => item.id === edge.toArtifactId,
+                        )
+                        return (
+                          <li key={edge.id} className="rounded-lg border border-border p-3">
+                            <p className="text-sm font-medium">
+                              {edge.relationType === 'contains' && pullRequest
+                                ? `PR #${pullRequest.number} contains ${shortSha(investigation.commitSha)}`
+                                : `${shortSha(investigation.commitSha)} modifies ${modifiedFile ? filePath(modifiedFile) : ''}`}
+                            </p>
+                            <p className="mt-1 text-xs text-muted-foreground">
+                              {edge.explanation}
+                            </p>
+                          </li>
+                        )
+                      })}
                     </ul>
                   )}
                 </section>
@@ -671,7 +876,7 @@ export default function Page() {
       </div>
 
       <footer className="border-t border-border bg-background/70 px-4 py-2 font-mono text-[11px] text-muted-foreground">
-        Verified evidence only: uploaded Git commit records and parsed name-status file records.
+        Verified evidence only: imported pull request references, Git commits, and name-status files.
       </footer>
     </div>
   )
