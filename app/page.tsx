@@ -4,15 +4,13 @@ import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from 're
 import {
   AlertTriangle,
   CheckCircle2,
-  FileCode2,
   GitBranch,
-  GitCommitVertical,
   GitPullRequest,
   ExternalLink,
-  Network,
   RefreshCw,
   Upload,
 } from 'lucide-react'
+import { EvidenceBrowser } from '@/components/evidence/evidence-browser'
 import type { Artifact } from '@/lib/domain'
 import {
   createRepositoryImportRunner,
@@ -35,7 +33,6 @@ import {
   pullRequestIngestionSummary,
   uploadPullRequestFixture,
   type CommitInvestigation,
-  type MissingContextWarning,
   type PullRequestIngestionResult,
   type PullRequestUploadRunner,
   type RepositoryImportResult,
@@ -67,16 +64,6 @@ function formatDate(iso: string) {
     hour12: false,
     timeZone: 'UTC',
   }).format(new Date(iso))
-}
-
-function changeLabel(artifact: Artifact) {
-  const value = artifact.metadata.changeStatus
-  return typeof value === 'string' ? value.replace('_', ' ') : 'changed'
-}
-
-function filePath(artifact: Artifact) {
-  const path = artifact.metadata.path
-  return typeof path === 'string' ? path : artifact.title
 }
 
 function presentError(error: unknown, operation: 'list' | 'investigation' | 'upload'): ApplicationError {
@@ -127,21 +114,6 @@ function presentPullRequestUploadError(error: unknown): ApplicationError {
     return { title: 'Backend request failed', message: error.message }
   }
   return presentError(error, 'upload')
-}
-
-function MissingContextList({ warnings }: { warnings: MissingContextWarning[] }) {
-  return (
-    <ul className="flex flex-col gap-3">
-      {warnings.map((warning) => (
-        <li key={warning.code} className="rounded-xl border border-border bg-card p-3">
-          <p className="font-mono text-[10px] uppercase tracking-widest text-primary">
-            {warning.code}
-          </p>
-          <p className="mt-2 text-sm leading-relaxed text-muted-foreground">{warning.message}</p>
-        </li>
-      ))}
-    </ul>
-  )
 }
 
 export default function Page() {
@@ -314,6 +286,13 @@ export default function Page() {
     () =>
       repositoryImportResult ? repositoryImportSummary(repositoryImportResult) : null,
     [repositoryImportResult],
+  )
+  const availableCommitShas = useMemo(
+    () =>
+      commits.flatMap((commit) =>
+        commit.externalId ? [commit.externalId] : [],
+      ),
+    [commits],
   )
 
   function handleRepositoryChange(event: ChangeEvent<HTMLInputElement>) {
@@ -902,216 +881,19 @@ export default function Page() {
             )}
 
             {investigation && (
-              <>
-                <section className="glass rounded-2xl border border-border p-5 shadow-2xl shadow-black/20">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="rounded-md bg-primary/15 px-2 py-0.5 font-mono text-xs text-primary">
-                      {shortSha(investigation.commitSha)}
-                    </span>
-                    <span className="font-mono text-xs text-muted-foreground">
-                      repo: {investigation.repositoryId}
-                    </span>
-                  </div>
-                  <h1 className="mt-3 text-2xl font-semibold tracking-tight">
-                    {investigation.selectedCommit.title}
-                  </h1>
-                  <p className="mt-3 max-w-3xl whitespace-pre-wrap text-sm leading-relaxed text-foreground/85">
-                    {investigation.selectedCommit.body}
-                  </p>
-                  <div className="mt-4 grid gap-3 md:grid-cols-3">
-                    <div className="rounded-xl border border-border bg-background/40 p-3">
-                      <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-                        Author
-                      </p>
-                      <p className="mt-1 text-sm font-medium">
-                        {investigation.selectedCommit.author?.displayName}
-                      </p>
-                    </div>
-                    <div className="rounded-xl border border-border bg-background/40 p-3">
-                      <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-                        Date
-                      </p>
-                      <p className="mt-1 text-sm font-medium">
-                        {formatDate(investigation.selectedCommit.occurredAt)}
-                      </p>
-                    </div>
-                    <div className="rounded-xl border border-border bg-background/40 p-3">
-                      <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-                        Files
-                      </p>
-                      <p className="mt-1 text-sm font-medium">
-                        {investigation.modifiedFiles.length}
-                      </p>
-                    </div>
-                  </div>
-                </section>
-
-                {investigation.linkedPullRequests.length > 0 && (
-                  <section className="rounded-2xl border border-border bg-card p-5">
-                    <div className="flex items-center gap-2">
-                      <GitPullRequest className="size-4 text-primary" aria-hidden="true" />
-                      <h2 className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-                        Linked Pull Requests
-                      </h2>
-                    </div>
-                    <ul className="mt-4 flex flex-col gap-3">
-                      {investigation.linkedPullRequests.map((pullRequest) => (
-                        <li key={pullRequest.id} className="rounded-xl border border-border p-4">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <span className="font-mono text-xs text-primary">
-                              PR #{pullRequest.number}
-                            </span>
-                            <span className="rounded-md bg-secondary px-2 py-0.5 font-mono text-[10px] uppercase text-muted-foreground">
-                              {pullRequest.state}
-                            </span>
-                            {pullRequest.url && (
-                              <a
-                                href={pullRequest.url}
-                                target="_blank"
-                                rel="noreferrer"
-                                className="ml-auto inline-flex items-center gap-1 text-xs text-primary hover:underline"
-                              >
-                                Open source
-                                <ExternalLink className="size-3" aria-hidden="true" />
-                              </a>
-                            )}
-                          </div>
-                          <h3 className="mt-2 text-sm font-semibold">{pullRequest.title}</h3>
-                          <p className="mt-1 text-xs text-muted-foreground">
-                            {pullRequest.author.login} -{' '}
-                            {formatDate(pullRequest.mergedAt ?? pullRequest.createdAt)}
-                          </p>
-                          <p className="mt-3 whitespace-pre-wrap text-sm leading-relaxed text-foreground/85">
-                            {pullRequest.body?.trim()
-                              ? pullRequest.body
-                              : 'No pull request description was imported.'}
-                          </p>
-                          <p className="mt-3 font-mono text-[11px] text-muted-foreground">
-                            Explicitly contains commit {shortSha(investigation.commitSha)}
-                          </p>
-                        </li>
-                      ))}
-                    </ul>
-                  </section>
-                )}
-
-                <section className="rounded-2xl border border-border bg-card p-5">
-                  <div className="flex items-center gap-2">
-                    <CheckCircle2 className="size-4 text-primary" aria-hidden="true" />
-                    <h2 className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-                      Verified Evidence
-                    </h2>
-                  </div>
-                  <ul className="mt-4 flex flex-col gap-2">
-                    {investigation.evidenceStatus.map((item) => (
-                      <li
-                        key={item.label}
-                        className="rounded-lg border border-primary/25 bg-primary/5 p-3 text-sm"
-                      >
-                        {item.label}
-                      </li>
-                    ))}
-                  </ul>
-                </section>
-
-                <section className="rounded-2xl border border-border bg-card p-5">
-                  <div className="flex items-center gap-2">
-                    <FileCode2 className="size-4 text-accent" aria-hidden="true" />
-                    <h2 className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-                      Modified Files
-                    </h2>
-                  </div>
-                  {investigation.modifiedFiles.length === 0 ? (
-                    <p className="mt-4 rounded-lg border border-dashed border-border p-4 text-sm text-muted-foreground">
-                      This commit was ingested without modified-file records.
-                    </p>
-                  ) : (
-                    <ul className="mt-4 grid gap-3 md:grid-cols-2">
-                      {investigation.modifiedFiles.map((artifact) => (
-                        <li key={artifact.id} className="rounded-xl border border-border p-3">
-                          <span className="rounded-md bg-accent/10 px-2 py-0.5 font-mono text-[10px] uppercase text-accent">
-                            {changeLabel(artifact)}
-                          </span>
-                          <p className="mt-2 break-all font-mono text-sm">{filePath(artifact)}</p>
-                          {typeof artifact.metadata.previousPath === 'string' && (
-                            <p className="mt-1 break-all font-mono text-xs text-muted-foreground">
-                              from {artifact.metadata.previousPath}
-                            </p>
-                          )}
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </section>
-
-                <section className="rounded-2xl border border-border bg-card p-5">
-                  <div className="flex items-center gap-2">
-                    <Network className="size-4 text-primary" aria-hidden="true" />
-                    <h2 className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-                      Explicit Evidence Edges
-                    </h2>
-                  </div>
-                  {investigation.evidenceEdges.length === 0 ? (
-                    <p className="mt-4 rounded-lg border border-dashed border-border p-4 text-sm text-muted-foreground">
-                      No explicit evidence edges exist for this commit.
-                    </p>
-                  ) : (
-                    <ul className="mt-4 flex flex-col gap-2">
-                      {investigation.evidenceEdges.map((edge) => {
-                        const pullRequest = investigation.linkedPullRequests.find(
-                          (item) => item.id === edge.fromArtifactId,
-                        )
-                        const modifiedFile = investigation.modifiedFiles.find(
-                          (item) => item.id === edge.toArtifactId,
-                        )
-                        return (
-                          <li key={edge.id} className="rounded-lg border border-border p-3">
-                            <p className="text-sm font-medium">
-                              {edge.relationType === 'contains' && pullRequest
-                                ? `PR #${pullRequest.number} contains ${shortSha(investigation.commitSha)}`
-                                : `${shortSha(investigation.commitSha)} modifies ${modifiedFile ? filePath(modifiedFile) : ''}`}
-                            </p>
-                            <p className="mt-1 text-xs text-muted-foreground">
-                              {edge.explanation}
-                            </p>
-                          </li>
-                        )
-                      })}
-                    </ul>
-                  )}
-                </section>
-
-                <section className="rounded-2xl border border-border bg-sidebar p-5 xl:hidden">
-                  <div className="mb-4 flex items-center gap-2">
-                    <AlertTriangle className="size-4 text-primary" aria-hidden="true" />
-                    <h2 className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-                      Missing Context
-                    </h2>
-                  </div>
-                  <MissingContextList warnings={investigation.missingContextWarnings} />
-                </section>
-              </>
+              <EvidenceBrowser
+                investigation={investigation}
+                availableCommitShas={availableCommitShas}
+                importWarnings={
+                  repositoryImportResult?.repositoryId === investigation.repositoryId
+                    ? repositoryImportResult.warnings
+                    : []
+                }
+                onSelectCommit={handleCommitSelection}
+              />
             )}
           </div>
         </main>
-
-        <aside className="hidden w-80 shrink-0 border-l border-border bg-sidebar p-4 xl:block 2xl:w-96">
-          <div className="flex h-full flex-col gap-4 overflow-y-auto">
-            <div className="flex items-center gap-2">
-              <AlertTriangle className="size-4 text-primary" aria-hidden="true" />
-              <h2 className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-                Missing Context
-              </h2>
-            </div>
-            {investigation ? (
-              <MissingContextList warnings={investigation.missingContextWarnings} />
-            ) : (
-              <p className="rounded-xl border border-border bg-card p-3 text-sm text-muted-foreground">
-                Missing-context warnings appear after a commit investigation loads.
-              </p>
-            )}
-          </div>
-        </aside>
       </div>
 
       <footer className="border-t border-border bg-background/70 px-4 py-2 font-mono text-[11px] text-muted-foreground">
