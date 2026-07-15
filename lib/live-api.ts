@@ -79,6 +79,8 @@ export interface IngestionValidationError {
 }
 
 export interface IngestionResult {
+  repositoryId: string
+  recordsParsed: number
   recordsInserted: number
   recordsUpdated: number
   recordsDeleted: number
@@ -99,13 +101,42 @@ export interface PullRequestIngestionResult {
   validationErrors: IngestionValidationError[]
 }
 
+export type RepositoryImportWarningCode =
+  | 'git_history_truncated'
+  | 'pull_requests_truncated'
+  | 'pull_request_commits_truncated'
+
+export interface RepositoryImportWarning {
+  code: RepositoryImportWarningCode
+  message: string
+}
+
+export interface RepositoryImportLimits {
+  maxCommits: number
+  maxPullRequests: number
+  maxCommitsPerPullRequest: number
+  maxRepositoryBytes: number
+}
+
+export interface RepositoryImportResult {
+  repositoryId: string
+  repositoryUrl: string
+  selectedCommitSha: string
+  gitIngestion: IngestionResult
+  pullRequestIngestion: PullRequestIngestionResult
+  warnings: RepositoryImportWarning[]
+  limits: RepositoryImportLimits
+}
+
 export class ApiResponseError extends Error {
   readonly status: number
+  readonly code: string | null
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, code: string | null = null) {
     super(message)
     this.name = 'ApiResponseError'
     this.status = status
+    this.code = code
   }
 }
 
@@ -152,6 +183,27 @@ function isNullableAbsoluteHttpUrl(value: unknown): value is string | null {
 
 function isFullCommitSha(value: unknown): value is string {
   return typeof value === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value)
+}
+
+function isAbsoluteHttpsGithubUrl(value: unknown): value is string {
+  if (typeof value !== 'string') return false
+  try {
+    const url = new URL(value)
+    const pathParts = url.pathname.split('/').filter(Boolean)
+    return (
+      url.protocol === 'https:' &&
+      url.hostname.toLowerCase() === 'github.com' &&
+      !url.username &&
+      !url.password &&
+      !url.port &&
+      !url.search &&
+      !url.hash &&
+      pathParts.length === 2 &&
+      url.pathname === `/${pathParts[0]}/${pathParts[1]}`
+    )
+  } catch {
+    return false
+  }
 }
 
 function isArtifact(value: unknown): value is Artifact {
@@ -371,10 +423,11 @@ export function parseCommitInvestigation(value: unknown): CommitInvestigation {
 }
 
 export function parseIngestionResult(value: unknown): IngestionResult {
-  if (!isRecord(value)) {
+  if (!isRecord(value) || typeof value.repositoryId !== 'string' || !value.repositoryId.trim()) {
     throw new Error('Backend returned an invalid ingestion result')
   }
   const numberFields = [
+    'recordsParsed',
     'recordsInserted',
     'recordsUpdated',
     'recordsDeleted',
@@ -385,6 +438,8 @@ export function parseIngestionResult(value: unknown): IngestionResult {
     throw new Error('Backend returned invalid ingestion counts')
   }
   return {
+    repositoryId: value.repositoryId,
+    recordsParsed: value.recordsParsed as number,
     recordsInserted: value.recordsInserted as number,
     recordsUpdated: value.recordsUpdated as number,
     recordsDeleted: value.recordsDeleted as number,
@@ -424,6 +479,99 @@ export function parsePullRequestIngestionResult(value: unknown): PullRequestInge
     explicitCommitReferencesUnresolved: value.explicitCommitReferencesUnresolved as number,
     validationErrors: parseValidationErrors(value.validationErrors),
   }
+}
+
+export function parseRepositoryImportResult(value: unknown): RepositoryImportResult {
+  if (
+    !isRecord(value) ||
+    typeof value.repositoryId !== 'string' ||
+    !value.repositoryId.trim() ||
+    !isAbsoluteHttpsGithubUrl(value.repositoryUrl) ||
+    !isFullCommitSha(value.selectedCommitSha)
+  ) {
+    throw new Error('Backend returned an invalid repository import result')
+  }
+
+  const gitIngestion = parseIngestionResult(value.gitIngestion)
+  const pullRequestIngestion = parsePullRequestIngestionResult(value.pullRequestIngestion)
+  if (
+    gitIngestion.repositoryId !== value.repositoryId ||
+    pullRequestIngestion.repositoryId !== value.repositoryId
+  ) {
+    throw new Error('Backend returned repository import data for different repositories')
+  }
+
+  const warningCodes: RepositoryImportWarningCode[] = [
+    'git_history_truncated',
+    'pull_requests_truncated',
+    'pull_request_commits_truncated',
+  ]
+  if (
+    !Array.isArray(value.warnings) ||
+    !value.warnings.every(
+      (warning) =>
+        isRecord(warning) &&
+        typeof warning.code === 'string' &&
+        warningCodes.includes(warning.code as RepositoryImportWarningCode) &&
+        typeof warning.message === 'string',
+    )
+  ) {
+    throw new Error('Backend returned invalid repository import warnings')
+  }
+
+  if (!isRecord(value.limits)) {
+    throw new Error('Backend returned invalid repository import limits')
+  }
+  const limits = value.limits
+  const limitFields = [
+    'maxCommits',
+    'maxPullRequests',
+    'maxCommitsPerPullRequest',
+    'maxRepositoryBytes',
+  ] as const
+  if (
+    limitFields.some(
+      (field) => !isNonNegativeInteger(limits[field]) || Number(limits[field]) === 0,
+    )
+  ) {
+    throw new Error('Backend returned invalid repository import limits')
+  }
+
+  return {
+    repositoryId: value.repositoryId,
+    repositoryUrl: value.repositoryUrl,
+    selectedCommitSha: value.selectedCommitSha,
+    gitIngestion,
+    pullRequestIngestion,
+    warnings: value.warnings as RepositoryImportWarning[],
+    limits: {
+      maxCommits: limits.maxCommits as number,
+      maxPullRequests: limits.maxPullRequests as number,
+      maxCommitsPerPullRequest: limits.maxCommitsPerPullRequest as number,
+      maxRepositoryBytes: limits.maxRepositoryBytes as number,
+    },
+  }
+}
+
+export async function importPublicRepository(options: {
+  apiBaseUrl: string
+  repositoryUrl: string
+  signal?: AbortSignal
+  fetchImplementation?: typeof fetch
+}): Promise<RepositoryImportResult> {
+  const response = await (options.fetchImplementation ?? fetch)(
+    `${options.apiBaseUrl}/api/repositories/import`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ repositoryUrl: options.repositoryUrl }),
+      signal: options.signal,
+    },
+  )
+  if (!response.ok) {
+    throw await apiErrorFromResponse(response)
+  }
+  return parseRepositoryImportResult(await response.json())
 }
 
 export function validatePullRequestFixtureFile(file: Pick<File, 'name' | 'size'>): void {
@@ -529,11 +677,19 @@ export function createPullRequestUploadRunner(
 
 export async function apiErrorFromResponse(response: Response): Promise<ApiResponseError> {
   let message = `Backend returned ${response.status}`
+  let code: string | null = null
   try {
     const body: unknown = await response.json()
     if (isRecord(body)) {
       if (typeof body.detail === 'string') {
         message = body.detail
+      } else if (
+        isRecord(body.detail) &&
+        typeof body.detail.code === 'string' &&
+        typeof body.detail.message === 'string'
+      ) {
+        code = body.detail.code
+        message = body.detail.message
       } else if (Array.isArray(body.detail)) {
         const messages = body.detail
           .filter(isRecord)
@@ -553,5 +709,5 @@ export async function apiErrorFromResponse(response: Response): Promise<ApiRespo
   } catch {
     // Keep the status-based fallback for non-JSON responses.
   }
-  return new ApiResponseError(response.status, message)
+  return new ApiResponseError(response.status, message, code)
 }

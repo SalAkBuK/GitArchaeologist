@@ -11,7 +11,7 @@ from typing import Callable
 from app.importers.errors import RepositoryImportError
 from app.importers.github import GitHubRepositoryReference
 from app.importers.limits import RepositoryImportLimits
-from app.parsers.git_log import FULL_HASH_RE
+from app.parsers.git_log import COMMIT_HEADER_RE, FULL_HASH_RE
 
 
 RunSubprocess = Callable[..., subprocess.CompletedProcess[bytes]]
@@ -132,9 +132,17 @@ class GitRepositoryAcquirer:
                     message="Repository exceeds the configured import size limit",
                     status_code=413,
                 )
+            log_content = self._decode(log_result.stdout)
+            first_imported_commit = COMMIT_HEADER_RE.search(log_content)
+            if first_imported_commit is None:
+                raise RepositoryImportError(
+                    code="empty_repository",
+                    message="Repository does not contain valid importable commits",
+                    status_code=422,
+                )
             return GitHistoryAcquisition(
-                log_content=self._decode(log_result.stdout),
-                selected_commit_sha=hashes[0].strip().lower(),
+                log_content=log_content,
+                selected_commit_sha=first_imported_commit.group(1).strip().lower(),
                 truncated=len(hashes) > self.limits.max_commits,
             )
 

@@ -133,6 +133,33 @@ def test_git_acquisition_uses_safe_bounded_commands_and_cleans_up(
     assert clone_root is not None and not clone_root.exists()
 
 
+def test_git_acquisition_selects_first_commit_emitted_for_ingestion(
+    tmp_path: Path,
+) -> None:
+    def runner(arguments: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        if "clone" in arguments:
+            clone_path = Path(arguments[-1])
+            (clone_path / ".git").mkdir(parents=True)
+            stdout = b""
+        elif "rev-list" in arguments:
+            # A merge HEAD can be excluded from name-status output by --diff-filter.
+            stdout = f"{HASH_ONE}\n".encode()
+        else:
+            stdout = commit_record(
+                HASH_TWO,
+                files=["M\tbackend/app/main.py"],
+            ).encode()
+        return subprocess.CompletedProcess(arguments, 0, stdout=stdout, stderr=b"")
+
+    result = GitRepositoryAcquirer(
+        RepositoryImportLimits(max_commits=1, temporary_directory=str(tmp_path)),
+        runner=runner,
+        git_executable="git",
+    ).acquire(normalize_github_repository_url("https://github.com/acme/platform"))
+
+    assert result.selected_commit_sha == HASH_TWO
+
+
 def test_git_timeout_and_size_failure_clean_temporary_directories(tmp_path: Path) -> None:
     timed_out_root: Path | None = None
 

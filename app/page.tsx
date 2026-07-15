@@ -15,11 +15,20 @@ import {
 } from 'lucide-react'
 import type { Artifact } from '@/lib/domain'
 import {
+  createRepositoryImportRunner,
+  isAbortError,
+  presentRepositoryImportError,
+  repositoryImportSummary,
+  validatePublicGithubRepositoryUrl,
+  type RepositoryImportRunner,
+} from '@/lib/repository-import'
+import {
   ApiResponseError,
   PULL_REQUEST_FIXTURE_ACCEPT,
   PullRequestFixtureClientError,
   apiErrorFromResponse,
   createPullRequestUploadRunner,
+  importPublicRepository,
   parseArtifactList,
   parseCommitInvestigation,
   parseIngestionResult,
@@ -29,11 +38,13 @@ import {
   type MissingContextWarning,
   type PullRequestIngestionResult,
   type PullRequestUploadRunner,
+  type RepositoryImportResult,
 } from '@/lib/live-api'
 
 interface ApplicationError {
   title: string
   message: string
+  code?: string
 }
 
 const API_BASE_URL =
@@ -66,10 +77,6 @@ function changeLabel(artifact: Artifact) {
 function filePath(artifact: Artifact) {
   const path = artifact.metadata.path
   return typeof path === 'string' ? path : artifact.title
-}
-
-function isAbortError(error: unknown) {
-  return error instanceof Error && error.name === 'AbortError'
 }
 
 function presentError(error: unknown, operation: 'list' | 'investigation' | 'upload'): ApplicationError {
@@ -138,6 +145,13 @@ function MissingContextList({ warnings }: { warnings: MissingContextWarning[] })
 }
 
 export default function Page() {
+  const [repositoryUrl, setRepositoryUrl] = useState('')
+  const [repositoryUrlError, setRepositoryUrlError] = useState<string | null>(null)
+  const [repositoryImporting, setRepositoryImporting] = useState(false)
+  const [repositoryImportResult, setRepositoryImportResult] =
+    useState<RepositoryImportResult | null>(null)
+  const [repositoryImportError, setRepositoryImportError] =
+    useState<ApplicationError | null>(null)
   const [repositoryId, setRepositoryId] = useState(DEFAULT_REPOSITORY_ID)
   const [commits, setCommits] = useState<Artifact[]>([])
   const [selectedSha, setSelectedSha] = useState<string | null>(null)
@@ -154,6 +168,13 @@ export default function Page() {
   const [pullRequestUploadError, setPullRequestUploadError] =
     useState<ApplicationError | null>(null)
   const [investigationRevision, setInvestigationRevision] = useState(0)
+  const [commitListRevision, setCommitListRevision] = useState(0)
+  const repositoryImportController = useRef<AbortController | null>(null)
+  const repositoryImportRunner = useRef<RepositoryImportRunner | null>(null)
+  const preferredCommitSha = useRef<string | null>(null)
+  if (repositoryImportRunner.current === null) {
+    repositoryImportRunner.current = createRepositoryImportRunner(setRepositoryImporting)
+  }
   const commitListController = useRef<AbortController | null>(null)
   const investigationController = useRef<AbortController | null>(null)
   const uploadController = useRef<AbortController | null>(null)
@@ -206,7 +227,10 @@ export default function Page() {
           return
         }
         setCommits(data)
-        setSelectedSha(data[0]?.externalId ?? null)
+        const importedSha = preferredCommitSha.current
+        const nextSha = importedSha ?? data[0]?.externalId ?? null
+        preferredCommitSha.current = null
+        setSelectedSha(nextSha)
       } catch (error) {
         if (
           !isAbortError(error) &&
@@ -228,7 +252,7 @@ export default function Page() {
     return () => {
       controller.abort()
     }
-  }, [normalizedRepositoryId])
+  }, [commitListRevision, normalizedRepositoryId])
 
   useEffect(() => {
     investigationController.current?.abort()
@@ -286,12 +310,15 @@ export default function Page() {
     }
   }, [investigationRevision, normalizedRepositoryId, selectedSha])
 
-  const selectedCommit = useMemo(
-    () => commits.find((commit) => commit.externalId === selectedSha),
-    [commits, selectedSha],
+  const importSummary = useMemo(
+    () =>
+      repositoryImportResult ? repositoryImportSummary(repositoryImportResult) : null,
+    [repositoryImportResult],
   )
 
   function handleRepositoryChange(event: ChangeEvent<HTMLInputElement>) {
+    repositoryImportController.current?.abort()
+    repositoryImportRunner.current?.cancel()
     commitListController.current?.abort()
     investigationController.current?.abort()
     uploadController.current?.abort()
@@ -300,6 +327,9 @@ export default function Page() {
     commitListRequestId.current += 1
     investigationRequestId.current += 1
     uploadRequestId.current += 1
+    preferredCommitSha.current = null
+    setRepositoryImportResult(null)
+    setRepositoryImportError(null)
     setCommits([])
     setSelectedSha(null)
     setInvestigation(null)
@@ -312,6 +342,59 @@ export default function Page() {
     setApplicationError(null)
     setUploadMessage(null)
     setRepositoryId(event.target.value)
+  }
+
+  async function handleRepositoryImport(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (repositoryImportRunner.current?.isActive()) return
+
+    const candidate = repositoryUrl.trim()
+    const validationError = validatePublicGithubRepositoryUrl(candidate)
+    setRepositoryUrlError(validationError)
+    if (validationError) return
+
+    repositoryImportController.current?.abort()
+    const controller = new AbortController()
+    repositoryImportController.current = controller
+    const startingRepositoryId = activeRepositoryId.current
+    setRepositoryImportError(null)
+    setRepositoryImportResult(null)
+    setApplicationError(null)
+
+    const outcome = await repositoryImportRunner.current?.run(
+      () =>
+        importPublicRepository({
+          apiBaseUrl: API_BASE_URL,
+          repositoryUrl: candidate,
+          signal: controller.signal,
+        }),
+      (result) => {
+        if (
+          controller.signal.aborted ||
+          activeRepositoryId.current !== startingRepositoryId
+        ) {
+          return
+        }
+
+        preferredCommitSha.current = result.selectedCommitSha
+        commitListController.current?.abort()
+        commitListRequestId.current += 1
+        setRepositoryImportResult(result)
+        setRepositoryImportError(null)
+        setApplicationError(null)
+        setRepositoryUrl(result.repositoryUrl)
+        activeRepositoryId.current = result.repositoryId
+        if (result.repositoryId === normalizedRepositoryId) {
+          setCommitListRevision((revision) => revision + 1)
+        } else {
+          setRepositoryId(result.repositoryId)
+        }
+      },
+    )
+
+    if (outcome?.error && !isAbortError(outcome.error) && !controller.signal.aborted) {
+      setRepositoryImportError(presentRepositoryImportError(outcome.error))
+    }
   }
 
   function handleCommitSelection(commitSha: string) {
@@ -628,6 +711,162 @@ export default function Page() {
 
         <main className="min-w-0 flex-1 overflow-y-auto p-4 md:p-6">
           <div className="mx-auto flex max-w-4xl flex-col gap-5">
+            <section className="border border-primary/35 bg-card p-4 md:p-5">
+              <div className="flex items-start gap-3">
+                <GitBranch className="mt-0.5 size-5 shrink-0 text-primary" aria-hidden="true" />
+                <div>
+                  <h1 className="text-base font-semibold">Import a public GitHub repository</h1>
+                  <p className="mt-1 text-sm text-muted-foreground">
+                    Enter a public github.com repository URL to import its commit and pull request
+                    evidence.
+                  </p>
+                </div>
+              </div>
+              <form onSubmit={handleRepositoryImport} className="mt-4" noValidate>
+                <label htmlFor="repository-url" className="text-sm font-medium">
+                  Repository URL
+                </label>
+                <div className="mt-2 flex flex-col gap-2 sm:flex-row">
+                  <input
+                    id="repository-url"
+                    name="repositoryUrl"
+                    type="url"
+                    value={repositoryUrl}
+                    onChange={(event) => {
+                      setRepositoryUrl(event.target.value)
+                      setRepositoryUrlError(null)
+                    }}
+                    placeholder="https://github.com/owner/repository"
+                    autoCapitalize="none"
+                    autoComplete="url"
+                    spellCheck={false}
+                    aria-describedby="repository-url-help repository-url-error"
+                    aria-invalid={repositoryUrlError ? true : undefined}
+                    disabled={repositoryImporting}
+                    className="min-w-0 flex-1 rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none focus:border-primary/60 disabled:cursor-not-allowed disabled:opacity-60"
+                  />
+                  <button
+                    type="submit"
+                    disabled={repositoryImporting}
+                    className="inline-flex min-h-10 shrink-0 items-center justify-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {repositoryImporting ? (
+                      <RefreshCw className="size-4 animate-spin" aria-hidden="true" />
+                    ) : (
+                      <GitBranch className="size-4" aria-hidden="true" />
+                    )}
+                    {repositoryImporting ? 'Importing' : 'Import repository'}
+                  </button>
+                </div>
+                <p id="repository-url-help" className="mt-2 text-xs text-muted-foreground">
+                  Only public GitHub repositories over HTTPS are supported.
+                </p>
+                {repositoryUrlError && (
+                  <p id="repository-url-error" className="mt-2 text-xs text-destructive">
+                    {repositoryUrlError}
+                  </p>
+                )}
+              </form>
+            </section>
+
+            {repositoryImportError && (
+              <section className="border border-destructive/40 bg-destructive/10 p-4" role="alert">
+                <div className="flex items-center gap-2 text-destructive">
+                  <AlertTriangle className="size-4" aria-hidden="true" />
+                  <h2 className="text-sm font-semibold">{repositoryImportError.title}</h2>
+                </div>
+                {repositoryImportError.code && (
+                  <p className="mt-2 font-mono text-[11px] text-destructive">
+                    {repositoryImportError.code}
+                  </p>
+                )}
+                <p className="mt-2 text-sm text-muted-foreground">
+                  {repositoryImportError.message}
+                </p>
+              </section>
+            )}
+
+            {repositoryImportResult && importSummary && (
+              <section className="border border-primary/35 bg-primary/5 p-4" aria-live="polite">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <div className="flex items-center gap-2 text-primary">
+                      {repositoryImportResult.warnings.length > 0 ? (
+                        <AlertTriangle className="size-4" aria-hidden="true" />
+                      ) : (
+                        <CheckCircle2 className="size-4" aria-hidden="true" />
+                      )}
+                      <h2 className="text-sm font-semibold">
+                        {repositoryImportResult.warnings.length > 0
+                          ? 'Import succeeded with limits'
+                          : 'Import succeeded'}
+                      </h2>
+                    </div>
+                    <a
+                      href={repositoryImportResult.repositoryUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="mt-2 inline-flex items-center gap-1 break-all text-sm text-primary hover:underline"
+                    >
+                      {repositoryImportResult.repositoryUrl}
+                      <ExternalLink className="size-3 shrink-0" aria-hidden="true" />
+                    </a>
+                  </div>
+                  <div className="text-right font-mono text-[11px] text-muted-foreground">
+                    <p>{repositoryImportResult.repositoryId}</p>
+                    <p className="mt-1">commit {shortSha(repositoryImportResult.selectedCommitSha)}</p>
+                  </div>
+                </div>
+
+                <div className="mt-4 grid gap-4 border-t border-primary/20 pt-4 md:grid-cols-3">
+                  {(
+                    [
+                      ['Git ingestion', importSummary.git],
+                      ['Pull request ingestion', importSummary.pullRequests],
+                      ['Effective limits', importSummary.limits],
+                    ] as const
+                  ).map(([title, items]) => (
+                    <div key={title}>
+                      <h3 className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+                        {title}
+                      </h3>
+                      <dl className="mt-2 space-y-1 text-xs">
+                        {items.map((item) => (
+                          <div key={item.label} className="flex items-baseline justify-between gap-3">
+                            <dt className="text-muted-foreground">{item.label}</dt>
+                            <dd className="font-mono text-foreground">
+                              {item.value.toLocaleString('en')}
+                            </dd>
+                          </div>
+                        ))}
+                      </dl>
+                    </div>
+                  ))}
+                </div>
+
+                {repositoryImportResult.warnings.length > 0 && (
+                  <div className="mt-4 border-t border-primary/20 pt-4">
+                    <h3 className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+                      Import warnings
+                    </h3>
+                    <ul className="mt-2 space-y-2">
+                      {repositoryImportResult.warnings.map((warning, index) => (
+                        <li
+                          key={`${warning.code}:${index}`}
+                          className="border-l-2 border-primary pl-3 text-sm"
+                        >
+                          <span className="font-mono text-[11px] text-primary">
+                            {warning.code}
+                          </span>
+                          <p className="mt-1 text-muted-foreground">{warning.message}</p>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </section>
+            )}
+
             {applicationError && (
               <section className="rounded-xl border border-destructive/40 bg-destructive/10 p-4">
                 <div className="flex items-center gap-2 text-destructive">
@@ -662,7 +901,7 @@ export default function Page() {
               </section>
             )}
 
-            {investigation && selectedCommit && (
+            {investigation && (
               <>
                 <section className="glass rounded-2xl border border-border p-5 shadow-2xl shadow-black/20">
                   <div className="flex flex-wrap items-center gap-2">
