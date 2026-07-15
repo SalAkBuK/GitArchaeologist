@@ -4,27 +4,44 @@ import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from 're
 import {
   AlertTriangle,
   CheckCircle2,
-  FileCode2,
   GitBranch,
-  GitCommitVertical,
-  Network,
+  GitPullRequest,
+  ExternalLink,
   RefreshCw,
   Upload,
 } from 'lucide-react'
+import { EvidenceBrowser } from '@/components/evidence/evidence-browser'
 import type { Artifact } from '@/lib/domain'
 import {
+  createRepositoryImportRunner,
+  isAbortError,
+  presentRepositoryImportError,
+  repositoryImportSummary,
+  validatePublicGithubRepositoryUrl,
+  type RepositoryImportRunner,
+} from '@/lib/repository-import'
+import {
   ApiResponseError,
+  PULL_REQUEST_FIXTURE_ACCEPT,
+  PullRequestFixtureClientError,
   apiErrorFromResponse,
+  createPullRequestUploadRunner,
+  importPublicRepository,
   parseArtifactList,
   parseCommitInvestigation,
   parseIngestionResult,
+  pullRequestIngestionSummary,
+  uploadPullRequestFixture,
   type CommitInvestigation,
-  type MissingContextWarning,
+  type PullRequestIngestionResult,
+  type PullRequestUploadRunner,
+  type RepositoryImportResult,
 } from '@/lib/live-api'
 
 interface ApplicationError {
   title: string
   message: string
+  code?: string
 }
 
 const API_BASE_URL =
@@ -47,20 +64,6 @@ function formatDate(iso: string) {
     hour12: false,
     timeZone: 'UTC',
   }).format(new Date(iso))
-}
-
-function changeLabel(artifact: Artifact) {
-  const value = artifact.metadata.changeStatus
-  return typeof value === 'string' ? value.replace('_', ' ') : 'changed'
-}
-
-function filePath(artifact: Artifact) {
-  const path = artifact.metadata.path
-  return typeof path === 'string' ? path : artifact.title
-}
-
-function isAbortError(error: unknown) {
-  return error instanceof Error && error.name === 'AbortError'
 }
 
 function presentError(error: unknown, operation: 'list' | 'investigation' | 'upload'): ApplicationError {
@@ -88,22 +91,39 @@ function presentError(error: unknown, operation: 'list' | 'investigation' | 'upl
   }
 }
 
-function MissingContextList({ warnings }: { warnings: MissingContextWarning[] }) {
-  return (
-    <ul className="flex flex-col gap-3">
-      {warnings.map((warning) => (
-        <li key={warning.code} className="rounded-xl border border-border bg-card p-3">
-          <p className="font-mono text-[10px] uppercase tracking-widest text-primary">
-            {warning.code.replaceAll('_', ' ')}
-          </p>
-          <p className="mt-2 text-sm leading-relaxed text-muted-foreground">{warning.message}</p>
-        </li>
-      ))}
-    </ul>
-  )
+function presentPullRequestUploadError(error: unknown): ApplicationError {
+  if (error instanceof PullRequestFixtureClientError) {
+    return {
+      title: error.code === 'wrong_extension' ? 'Wrong file type' : 'Fixture too large',
+      message: error.message,
+    }
+  }
+  if (error instanceof ApiResponseError) {
+    const message = error.message.toLowerCase()
+    if (error.status === 413) return { title: 'Fixture too large', message: error.message }
+    if (message.includes('repositoryid') && message.includes('match')) {
+      return { title: 'Repository mismatch', message: error.message }
+    }
+    if (message.includes('utf-8') || message.includes('utf-16')) {
+      return { title: 'Unsupported encoding', message: error.message }
+    }
+    if (message.includes('malformed json')) return { title: 'Malformed JSON', message: error.message }
+    if (error.status === 400 || error.status === 422) {
+      return { title: 'Invalid pull request fixture', message: error.message }
+    }
+    return { title: 'Backend request failed', message: error.message }
+  }
+  return presentError(error, 'upload')
 }
 
 export default function Page() {
+  const [repositoryUrl, setRepositoryUrl] = useState('')
+  const [repositoryUrlError, setRepositoryUrlError] = useState<string | null>(null)
+  const [repositoryImporting, setRepositoryImporting] = useState(false)
+  const [repositoryImportResult, setRepositoryImportResult] =
+    useState<RepositoryImportResult | null>(null)
+  const [repositoryImportError, setRepositoryImportError] =
+    useState<ApplicationError | null>(null)
   const [repositoryId, setRepositoryId] = useState(DEFAULT_REPOSITORY_ID)
   const [commits, setCommits] = useState<Artifact[]>([])
   const [selectedSha, setSelectedSha] = useState<string | null>(null)
@@ -114,9 +134,27 @@ export default function Page() {
   const [notFound, setNotFound] = useState(false)
   const [uploadMessage, setUploadMessage] = useState<string | null>(null)
   const [uploading, setUploading] = useState(false)
+  const [pullRequestUploading, setPullRequestUploading] = useState(false)
+  const [pullRequestUploadResult, setPullRequestUploadResult] =
+    useState<PullRequestIngestionResult | null>(null)
+  const [pullRequestUploadError, setPullRequestUploadError] =
+    useState<ApplicationError | null>(null)
+  const [investigationRevision, setInvestigationRevision] = useState(0)
+  const [commitListRevision, setCommitListRevision] = useState(0)
+  const repositoryImportController = useRef<AbortController | null>(null)
+  const repositoryImportRunner = useRef<RepositoryImportRunner | null>(null)
+  const preferredCommitSha = useRef<string | null>(null)
+  if (repositoryImportRunner.current === null) {
+    repositoryImportRunner.current = createRepositoryImportRunner(setRepositoryImporting)
+  }
   const commitListController = useRef<AbortController | null>(null)
   const investigationController = useRef<AbortController | null>(null)
   const uploadController = useRef<AbortController | null>(null)
+  const pullRequestUploadController = useRef<AbortController | null>(null)
+  const pullRequestUploadRunner = useRef<PullRequestUploadRunner | null>(null)
+  if (pullRequestUploadRunner.current === null) {
+    pullRequestUploadRunner.current = createPullRequestUploadRunner(setPullRequestUploading)
+  }
   const commitListRequestId = useRef(0)
   const investigationRequestId = useRef(0)
   const uploadRequestId = useRef(0)
@@ -161,7 +199,10 @@ export default function Page() {
           return
         }
         setCommits(data)
-        setSelectedSha(data[0]?.externalId ?? null)
+        const importedSha = preferredCommitSha.current
+        const nextSha = importedSha ?? data[0]?.externalId ?? null
+        preferredCommitSha.current = null
+        setSelectedSha(nextSha)
       } catch (error) {
         if (
           !isAbortError(error) &&
@@ -183,7 +224,7 @@ export default function Page() {
     return () => {
       controller.abort()
     }
-  }, [normalizedRepositoryId])
+  }, [commitListRevision, normalizedRepositoryId])
 
   useEffect(() => {
     investigationController.current?.abort()
@@ -239,20 +280,35 @@ export default function Page() {
     return () => {
       controller.abort()
     }
-  }, [normalizedRepositoryId, selectedSha])
+  }, [investigationRevision, normalizedRepositoryId, selectedSha])
 
-  const selectedCommit = useMemo(
-    () => commits.find((commit) => commit.externalId === selectedSha),
-    [commits, selectedSha],
+  const importSummary = useMemo(
+    () =>
+      repositoryImportResult ? repositoryImportSummary(repositoryImportResult) : null,
+    [repositoryImportResult],
+  )
+  const availableCommitShas = useMemo(
+    () =>
+      commits.flatMap((commit) =>
+        commit.externalId ? [commit.externalId] : [],
+      ),
+    [commits],
   )
 
   function handleRepositoryChange(event: ChangeEvent<HTMLInputElement>) {
+    repositoryImportController.current?.abort()
+    repositoryImportRunner.current?.cancel()
     commitListController.current?.abort()
     investigationController.current?.abort()
     uploadController.current?.abort()
+    pullRequestUploadController.current?.abort()
+    pullRequestUploadRunner.current?.cancel()
     commitListRequestId.current += 1
     investigationRequestId.current += 1
     uploadRequestId.current += 1
+    preferredCommitSha.current = null
+    setRepositoryImportResult(null)
+    setRepositoryImportError(null)
     setCommits([])
     setSelectedSha(null)
     setInvestigation(null)
@@ -260,9 +316,64 @@ export default function Page() {
     setLoadingCommits(false)
     setLoadingInvestigation(false)
     setUploading(false)
+    setPullRequestUploadResult(null)
+    setPullRequestUploadError(null)
     setApplicationError(null)
     setUploadMessage(null)
     setRepositoryId(event.target.value)
+  }
+
+  async function handleRepositoryImport(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (repositoryImportRunner.current?.isActive()) return
+
+    const candidate = repositoryUrl.trim()
+    const validationError = validatePublicGithubRepositoryUrl(candidate)
+    setRepositoryUrlError(validationError)
+    if (validationError) return
+
+    repositoryImportController.current?.abort()
+    const controller = new AbortController()
+    repositoryImportController.current = controller
+    const startingRepositoryId = activeRepositoryId.current
+    setRepositoryImportError(null)
+    setRepositoryImportResult(null)
+    setApplicationError(null)
+
+    const outcome = await repositoryImportRunner.current?.run(
+      () =>
+        importPublicRepository({
+          apiBaseUrl: API_BASE_URL,
+          repositoryUrl: candidate,
+          signal: controller.signal,
+        }),
+      (result) => {
+        if (
+          controller.signal.aborted ||
+          activeRepositoryId.current !== startingRepositoryId
+        ) {
+          return
+        }
+
+        preferredCommitSha.current = result.selectedCommitSha
+        commitListController.current?.abort()
+        commitListRequestId.current += 1
+        setRepositoryImportResult(result)
+        setRepositoryImportError(null)
+        setApplicationError(null)
+        setRepositoryUrl(result.repositoryUrl)
+        activeRepositoryId.current = result.repositoryId
+        if (result.repositoryId === normalizedRepositoryId) {
+          setCommitListRevision((revision) => revision + 1)
+        } else {
+          setRepositoryId(result.repositoryId)
+        }
+      },
+    )
+
+    if (outcome?.error && !isAbortError(outcome.error) && !controller.signal.aborted) {
+      setRepositoryImportError(presentRepositoryImportError(outcome.error))
+    }
   }
 
   function handleCommitSelection(commitSha: string) {
@@ -361,6 +472,48 @@ export default function Page() {
     }
   }
 
+  async function handlePullRequestUpload(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const form = event.currentTarget
+    const input = form.elements.namedItem('pullRequestFixture') as HTMLInputElement | null
+    const file = input?.files?.[0]
+    if (!file || !normalizedRepositoryId) {
+      setPullRequestUploadError({
+        title: 'Fixture required',
+        message: 'Choose a pull request JSON fixture and repository ID first.',
+      })
+      return
+    }
+
+    const targetRepositoryId = normalizedRepositoryId
+    setPullRequestUploadError(null)
+    setPullRequestUploadResult(null)
+    try {
+      await pullRequestUploadRunner.current?.run(
+        async () => {
+          const controller = new AbortController()
+          pullRequestUploadController.current = controller
+          return uploadPullRequestFixture({
+            apiBaseUrl: API_BASE_URL,
+            repositoryId: targetRepositoryId,
+            file,
+            signal: controller.signal,
+          })
+        },
+        (result) => {
+          if (activeRepositoryId.current !== targetRepositoryId) return
+          setPullRequestUploadResult(result)
+          form.reset()
+          setInvestigationRevision((revision) => revision + 1)
+        },
+      )
+    } catch (error) {
+      if (!isAbortError(error) && activeRepositoryId.current === targetRepositoryId) {
+        setPullRequestUploadError(presentPullRequestUploadError(error))
+      }
+    }
+  }
+
   return (
     <div className="flex h-dvh flex-col overflow-hidden bg-background">
       <header className="flex items-center justify-between gap-4 border-b border-border bg-background/70 px-4 py-3 backdrop-blur">
@@ -420,6 +573,66 @@ export default function Page() {
               )}
             </form>
 
+            <details className="rounded-xl border border-border bg-card p-3">
+              <summary className="flex cursor-pointer list-none items-center gap-2">
+                <GitPullRequest className="size-4 text-primary" aria-hidden="true" />
+                <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+                  Advanced: PR Fixture
+                </p>
+              </summary>
+              <form onSubmit={handlePullRequestUpload} className="mt-3 border-t border-border pt-3">
+                <input
+                  name="pullRequestFixture"
+                  type="file"
+                  accept={PULL_REQUEST_FIXTURE_ACCEPT}
+                  disabled={pullRequestUploading}
+                  className="w-full text-xs text-muted-foreground file:mr-3 file:rounded-md file:border-0 file:bg-secondary file:px-2 file:py-1.5 file:text-xs file:text-foreground disabled:opacity-50"
+                />
+                <button
+                  type="submit"
+                  disabled={pullRequestUploading}
+                  className="mt-3 flex w-full items-center justify-center gap-2 rounded-lg bg-primary px-3 py-2 text-sm font-medium text-primary-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <Upload className="size-4" aria-hidden="true" />
+                  {pullRequestUploading ? 'Uploading fixture' : 'Upload PR fixture'}
+                </button>
+
+                {pullRequestUploadError && (
+                  <div className="mt-3 rounded-lg border border-destructive/40 bg-destructive/10 p-2.5">
+                    <p className="text-xs font-medium text-destructive">
+                      {pullRequestUploadError.title}
+                    </p>
+                    <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                      {pullRequestUploadError.message}
+                    </p>
+                  </div>
+                )}
+
+                {pullRequestUploadResult && (
+                  <div className="mt-3 space-y-1 border-t border-border pt-3 font-mono text-[11px] text-muted-foreground">
+                    {pullRequestIngestionSummary(pullRequestUploadResult).map((line) => (
+                      <p key={line}>{line}</p>
+                    ))}
+                    {pullRequestUploadResult.recordsRejected > 0 && (
+                      <div className="pt-2 font-sans">
+                        <ul className="mt-2 max-h-40 space-y-2 overflow-y-auto pr-1">
+                          {pullRequestUploadResult.validationErrors.map((error) => (
+                            <li
+                              key={`${error.recordNumber}:${error.externalId ?? ''}:${error.message}`}
+                              className="rounded-md border border-border bg-background/40 p-2 text-xs"
+                            >
+                              <span className="font-mono text-primary">Record {error.recordNumber}</span>{' '}
+                              <span className="text-muted-foreground">{error.message}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </form>
+            </details>
+
             <div>
               <div className="mb-2 flex items-center justify-between">
                 <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
@@ -477,6 +690,162 @@ export default function Page() {
 
         <main className="min-w-0 flex-1 overflow-y-auto p-4 md:p-6">
           <div className="mx-auto flex max-w-4xl flex-col gap-5">
+            <section className="border border-primary/35 bg-card p-4 md:p-5">
+              <div className="flex items-start gap-3">
+                <GitBranch className="mt-0.5 size-5 shrink-0 text-primary" aria-hidden="true" />
+                <div>
+                  <h1 className="text-base font-semibold">Import a public GitHub repository</h1>
+                  <p className="mt-1 text-sm text-muted-foreground">
+                    Enter a public github.com repository URL to import its commit and pull request
+                    evidence.
+                  </p>
+                </div>
+              </div>
+              <form onSubmit={handleRepositoryImport} className="mt-4" noValidate>
+                <label htmlFor="repository-url" className="text-sm font-medium">
+                  Repository URL
+                </label>
+                <div className="mt-2 flex flex-col gap-2 sm:flex-row">
+                  <input
+                    id="repository-url"
+                    name="repositoryUrl"
+                    type="url"
+                    value={repositoryUrl}
+                    onChange={(event) => {
+                      setRepositoryUrl(event.target.value)
+                      setRepositoryUrlError(null)
+                    }}
+                    placeholder="https://github.com/owner/repository"
+                    autoCapitalize="none"
+                    autoComplete="url"
+                    spellCheck={false}
+                    aria-describedby="repository-url-help repository-url-error"
+                    aria-invalid={repositoryUrlError ? true : undefined}
+                    disabled={repositoryImporting}
+                    className="min-w-0 flex-1 rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none focus:border-primary/60 disabled:cursor-not-allowed disabled:opacity-60"
+                  />
+                  <button
+                    type="submit"
+                    disabled={repositoryImporting}
+                    className="inline-flex min-h-10 shrink-0 items-center justify-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {repositoryImporting ? (
+                      <RefreshCw className="size-4 animate-spin" aria-hidden="true" />
+                    ) : (
+                      <GitBranch className="size-4" aria-hidden="true" />
+                    )}
+                    {repositoryImporting ? 'Importing' : 'Import repository'}
+                  </button>
+                </div>
+                <p id="repository-url-help" className="mt-2 text-xs text-muted-foreground">
+                  Only public GitHub repositories over HTTPS are supported.
+                </p>
+                {repositoryUrlError && (
+                  <p id="repository-url-error" className="mt-2 text-xs text-destructive">
+                    {repositoryUrlError}
+                  </p>
+                )}
+              </form>
+            </section>
+
+            {repositoryImportError && (
+              <section className="border border-destructive/40 bg-destructive/10 p-4" role="alert">
+                <div className="flex items-center gap-2 text-destructive">
+                  <AlertTriangle className="size-4" aria-hidden="true" />
+                  <h2 className="text-sm font-semibold">{repositoryImportError.title}</h2>
+                </div>
+                {repositoryImportError.code && (
+                  <p className="mt-2 font-mono text-[11px] text-destructive">
+                    {repositoryImportError.code}
+                  </p>
+                )}
+                <p className="mt-2 text-sm text-muted-foreground">
+                  {repositoryImportError.message}
+                </p>
+              </section>
+            )}
+
+            {repositoryImportResult && importSummary && (
+              <section className="border border-primary/35 bg-primary/5 p-4" aria-live="polite">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <div className="flex items-center gap-2 text-primary">
+                      {repositoryImportResult.warnings.length > 0 ? (
+                        <AlertTriangle className="size-4" aria-hidden="true" />
+                      ) : (
+                        <CheckCircle2 className="size-4" aria-hidden="true" />
+                      )}
+                      <h2 className="text-sm font-semibold">
+                        {repositoryImportResult.warnings.length > 0
+                          ? 'Import succeeded with limits'
+                          : 'Import succeeded'}
+                      </h2>
+                    </div>
+                    <a
+                      href={repositoryImportResult.repositoryUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="mt-2 inline-flex items-center gap-1 break-all text-sm text-primary hover:underline"
+                    >
+                      {repositoryImportResult.repositoryUrl}
+                      <ExternalLink className="size-3 shrink-0" aria-hidden="true" />
+                    </a>
+                  </div>
+                  <div className="text-right font-mono text-[11px] text-muted-foreground">
+                    <p>{repositoryImportResult.repositoryId}</p>
+                    <p className="mt-1">commit {shortSha(repositoryImportResult.selectedCommitSha)}</p>
+                  </div>
+                </div>
+
+                <div className="mt-4 grid gap-4 border-t border-primary/20 pt-4 md:grid-cols-3">
+                  {(
+                    [
+                      ['Git ingestion', importSummary.git],
+                      ['Pull request ingestion', importSummary.pullRequests],
+                      ['Effective limits', importSummary.limits],
+                    ] as const
+                  ).map(([title, items]) => (
+                    <div key={title}>
+                      <h3 className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+                        {title}
+                      </h3>
+                      <dl className="mt-2 space-y-1 text-xs">
+                        {items.map((item) => (
+                          <div key={item.label} className="flex items-baseline justify-between gap-3">
+                            <dt className="text-muted-foreground">{item.label}</dt>
+                            <dd className="font-mono text-foreground">
+                              {item.value.toLocaleString('en')}
+                            </dd>
+                          </div>
+                        ))}
+                      </dl>
+                    </div>
+                  ))}
+                </div>
+
+                {repositoryImportResult.warnings.length > 0 && (
+                  <div className="mt-4 border-t border-primary/20 pt-4">
+                    <h3 className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+                      Import warnings
+                    </h3>
+                    <ul className="mt-2 space-y-2">
+                      {repositoryImportResult.warnings.map((warning, index) => (
+                        <li
+                          key={`${warning.code}:${index}`}
+                          className="border-l-2 border-primary pl-3 text-sm"
+                        >
+                          <span className="font-mono text-[11px] text-primary">
+                            {warning.code}
+                          </span>
+                          <p className="mt-1 text-muted-foreground">{warning.message}</p>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </section>
+            )}
+
             {applicationError && (
               <section className="rounded-xl border border-destructive/40 bg-destructive/10 p-4">
                 <div className="flex items-center gap-2 text-destructive">
@@ -511,167 +880,24 @@ export default function Page() {
               </section>
             )}
 
-            {investigation && selectedCommit && (
-              <>
-                <section className="glass rounded-2xl border border-border p-5 shadow-2xl shadow-black/20">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="rounded-md bg-primary/15 px-2 py-0.5 font-mono text-xs text-primary">
-                      {shortSha(investigation.commitSha)}
-                    </span>
-                    <span className="font-mono text-xs text-muted-foreground">
-                      repo: {investigation.repositoryId}
-                    </span>
-                  </div>
-                  <h1 className="mt-3 text-2xl font-semibold tracking-tight">
-                    {investigation.selectedCommit.title}
-                  </h1>
-                  <p className="mt-3 max-w-3xl whitespace-pre-wrap text-sm leading-relaxed text-foreground/85">
-                    {investigation.selectedCommit.body}
-                  </p>
-                  <div className="mt-4 grid gap-3 md:grid-cols-3">
-                    <div className="rounded-xl border border-border bg-background/40 p-3">
-                      <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-                        Author
-                      </p>
-                      <p className="mt-1 text-sm font-medium">
-                        {investigation.selectedCommit.author?.displayName}
-                      </p>
-                    </div>
-                    <div className="rounded-xl border border-border bg-background/40 p-3">
-                      <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-                        Date
-                      </p>
-                      <p className="mt-1 text-sm font-medium">
-                        {formatDate(investigation.selectedCommit.occurredAt)}
-                      </p>
-                    </div>
-                    <div className="rounded-xl border border-border bg-background/40 p-3">
-                      <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-                        Files
-                      </p>
-                      <p className="mt-1 text-sm font-medium">
-                        {investigation.modifiedFiles.length}
-                      </p>
-                    </div>
-                  </div>
-                </section>
-
-                <section className="rounded-2xl border border-border bg-card p-5">
-                  <div className="flex items-center gap-2">
-                    <CheckCircle2 className="size-4 text-primary" aria-hidden="true" />
-                    <h2 className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-                      Verified Evidence
-                    </h2>
-                  </div>
-                  <ul className="mt-4 flex flex-col gap-2">
-                    {investigation.evidenceStatus.map((item) => (
-                      <li
-                        key={item.label}
-                        className="rounded-lg border border-primary/25 bg-primary/5 p-3 text-sm"
-                      >
-                        {item.label}
-                      </li>
-                    ))}
-                  </ul>
-                </section>
-
-                <section className="rounded-2xl border border-border bg-card p-5">
-                  <div className="flex items-center gap-2">
-                    <FileCode2 className="size-4 text-accent" aria-hidden="true" />
-                    <h2 className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-                      Modified Files
-                    </h2>
-                  </div>
-                  {investigation.modifiedFiles.length === 0 ? (
-                    <p className="mt-4 rounded-lg border border-dashed border-border p-4 text-sm text-muted-foreground">
-                      This commit was ingested without modified-file records.
-                    </p>
-                  ) : (
-                    <ul className="mt-4 grid gap-3 md:grid-cols-2">
-                      {investigation.modifiedFiles.map((artifact) => (
-                        <li key={artifact.id} className="rounded-xl border border-border p-3">
-                          <span className="rounded-md bg-accent/10 px-2 py-0.5 font-mono text-[10px] uppercase text-accent">
-                            {changeLabel(artifact)}
-                          </span>
-                          <p className="mt-2 break-all font-mono text-sm">{filePath(artifact)}</p>
-                          {typeof artifact.metadata.previousPath === 'string' && (
-                            <p className="mt-1 break-all font-mono text-xs text-muted-foreground">
-                              from {artifact.metadata.previousPath}
-                            </p>
-                          )}
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </section>
-
-                <section className="rounded-2xl border border-border bg-card p-5">
-                  <div className="flex items-center gap-2">
-                    <Network className="size-4 text-primary" aria-hidden="true" />
-                    <h2 className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-                      Explicit Evidence Edges
-                    </h2>
-                  </div>
-                  {investigation.evidenceEdges.length === 0 ? (
-                    <p className="mt-4 rounded-lg border border-dashed border-border p-4 text-sm text-muted-foreground">
-                      No commit-to-file edges exist because no file records were ingested.
-                    </p>
-                  ) : (
-                    <ul className="mt-4 flex flex-col gap-2">
-                      {investigation.evidenceEdges.map((edge) => (
-                        <li key={edge.id} className="rounded-lg border border-border p-3">
-                          <p className="text-sm font-medium">
-                            {shortSha(investigation.commitSha)} modifies{' '}
-                            {filePath(
-                              investigation.modifiedFiles.find(
-                                (fileArtifact) => fileArtifact.id === edge.toArtifactId,
-                              ) ?? investigation.modifiedFiles[0],
-                            )}
-                          </p>
-                          <p className="mt-1 text-xs text-muted-foreground">
-                            {edge.explanation}
-                          </p>
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </section>
-
-                <section className="rounded-2xl border border-border bg-sidebar p-5 xl:hidden">
-                  <div className="mb-4 flex items-center gap-2">
-                    <AlertTriangle className="size-4 text-primary" aria-hidden="true" />
-                    <h2 className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-                      Missing Context
-                    </h2>
-                  </div>
-                  <MissingContextList warnings={investigation.missingContextWarnings} />
-                </section>
-              </>
+            {investigation && (
+              <EvidenceBrowser
+                investigation={investigation}
+                availableCommitShas={availableCommitShas}
+                importWarnings={
+                  repositoryImportResult?.repositoryId === investigation.repositoryId
+                    ? repositoryImportResult.warnings
+                    : []
+                }
+                onSelectCommit={handleCommitSelection}
+              />
             )}
           </div>
         </main>
-
-        <aside className="hidden w-80 shrink-0 border-l border-border bg-sidebar p-4 xl:block 2xl:w-96">
-          <div className="flex h-full flex-col gap-4 overflow-y-auto">
-            <div className="flex items-center gap-2">
-              <AlertTriangle className="size-4 text-primary" aria-hidden="true" />
-              <h2 className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
-                Missing Context
-              </h2>
-            </div>
-            {investigation ? (
-              <MissingContextList warnings={investigation.missingContextWarnings} />
-            ) : (
-              <p className="rounded-xl border border-border bg-card p-3 text-sm text-muted-foreground">
-                Missing-context warnings appear after a commit investigation loads.
-              </p>
-            )}
-          </div>
-        </aside>
       </div>
 
       <footer className="border-t border-border bg-background/70 px-4 py-2 font-mono text-[11px] text-muted-foreground">
-        Verified evidence only: uploaded Git commit records and parsed name-status file records.
+        Verified evidence only: imported pull request references, Git commits, and name-status files.
       </footer>
     </div>
   )

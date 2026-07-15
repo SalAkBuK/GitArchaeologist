@@ -12,10 +12,19 @@ class GitIngestionService:
         self.repository = ArtifactRepository(session)
         self.parser = parser or GitLogParser()
 
-    def ingest(self, repository_id: str, content: str) -> IngestionResult:
+    def ingest(
+        self,
+        repository_id: str,
+        content: str,
+        *,
+        commit: bool = True,
+    ) -> IngestionResult:
         normalized_repository_id = repository_id.strip()
         parse_result = self.parser.parse(content, normalized_repository_id)
-        reconciliation = self.repository.reconcile_snapshots(parse_result.artifacts)
+        reconciliation = self.repository.reconcile_snapshots(
+            parse_result.artifacts,
+            commit=commit,
+        )
         return IngestionResult(
             repositoryId=normalized_repository_id,
             recordsParsed=len(parse_result.artifacts),
