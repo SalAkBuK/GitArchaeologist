@@ -51,7 +51,12 @@ class ArtifactRepository:
     def __init__(self, session: Session) -> None:
         self.session = session
 
-    def reconcile_snapshots(self, artifacts: list[ArtifactCreate]) -> ReconciliationResult:
+    def reconcile_snapshots(
+        self,
+        artifacts: list[ArtifactCreate],
+        *,
+        commit: bool = True,
+    ) -> ReconciliationResult:
         if not artifacts:
             return ReconciliationResult()
 
@@ -129,7 +134,8 @@ class ArtifactRepository:
                         deleted += 1
 
             self.session.flush()
-            self.session.commit()
+            if commit:
+                self.session.commit()
         except Exception:
             self.session.rollback()
             raise
@@ -142,7 +148,10 @@ class ArtifactRepository:
         )
 
     def reconcile_pull_requests(
-        self, artifacts: list[ArtifactCreate]
+        self,
+        artifacts: list[ArtifactCreate],
+        *,
+        commit: bool = True,
     ) -> ReconciliationResult:
         if not artifacts:
             return ReconciliationResult()
@@ -169,7 +178,8 @@ class ArtifactRepository:
                     updated += 1
 
             self.session.flush()
-            self.session.commit()
+            if commit:
+                self.session.commit()
         except Exception:
             self.session.rollback()
             raise

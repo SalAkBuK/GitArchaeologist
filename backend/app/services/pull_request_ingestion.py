@@ -16,10 +16,19 @@ class PullRequestIngestionService:
         self.repository = ArtifactRepository(session)
         self.parser = parser or PullRequestFixtureParser()
 
-    def ingest(self, repository_id: str, content: str) -> PullRequestIngestionResult:
+    def ingest(
+        self,
+        repository_id: str,
+        content: str,
+        *,
+        commit: bool = True,
+    ) -> PullRequestIngestionResult:
         normalized_repository_id = repository_id.strip()
         parse_result = self.parser.parse(content, normalized_repository_id)
-        reconciliation = self.repository.reconcile_pull_requests(parse_result.artifacts)
+        reconciliation = self.repository.reconcile_pull_requests(
+            parse_result.artifacts,
+            commit=commit,
+        )
 
         known_commit_shas = {
             artifact.external_id

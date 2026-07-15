@@ -10,12 +10,18 @@ from app.database.session import get_db
 from app.repositories.artifacts import ArtifactRepository
 from app.parsers.git_log import FULL_HASH_RE
 from app.parsers.pull_request_fixture import PullRequestFixtureFormatError
+from app.importers.errors import RepositoryImportError
 from app.schemas.artifact import ArtifactRead
 from app.schemas.ingestion import IngestionResult
 from app.schemas.investigation import CommitInvestigationRead
 from app.schemas.pull_request import PullRequestIngestionResult
+from app.schemas.repository_import import (
+    RepositoryImportRequest,
+    RepositoryImportResponse,
+)
 from app.services.git_ingestion import GitIngestionService
 from app.services.pull_request_ingestion import PullRequestIngestionService
+from app.services.repository_import import RepositoryImportService
 
 
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
@@ -58,6 +64,33 @@ def _decode_utf8_upload(raw_content: bytes, *, upload_type: str) -> str:
 @router.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     return HealthResponse()
+
+
+@router.post(
+    "/api/repositories/import",
+    response_model=RepositoryImportResponse,
+    response_model_by_alias=True,
+)
+def import_public_repository(
+    request: RepositoryImportRequest,
+    session: Annotated[Session, Depends(get_db)],
+) -> RepositoryImportResponse:
+    try:
+        return RepositoryImportService(session).import_repository(request.repository_url)
+    except RepositoryImportError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
+    except Exception as exc:
+        session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "code": "repository_import_failed",
+                "message": "Repository import failed",
+            },
+        ) from exc
 
 
 @router.post(
