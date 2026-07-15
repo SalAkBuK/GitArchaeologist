@@ -12,6 +12,7 @@ from app.parsers.git_log import FULL_HASH_RE
 from app.parsers.pull_request_fixture import PullRequestFixtureFormatError
 from app.importers.errors import RepositoryImportError
 from app.schemas.artifact import ArtifactRead
+from app.schemas.explanation import ExplanationRead, ExplanationRequest
 from app.schemas.ingestion import IngestionResult
 from app.schemas.investigation import CommitInvestigationRead
 from app.schemas.pull_request import PullRequestIngestionResult
@@ -22,6 +23,13 @@ from app.schemas.repository_import import (
 from app.services.git_ingestion import GitIngestionService
 from app.services.pull_request_ingestion import PullRequestIngestionService
 from app.services.repository_import import RepositoryImportService
+from app.services.explanation import (
+    ExplanationArtifactNotFoundError,
+    ExplanationCrossRepositoryError,
+    ExplanationDisconnectedArtifactError,
+    ExplanationService,
+    ExplanationUnsupportedArtifactError,
+)
 
 
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
@@ -216,3 +224,61 @@ def investigate_commit(
             detail="Commit artifact not found",
         )
     return investigation
+
+
+@router.post(
+    "/api/explanations",
+    response_model=ExplanationRead,
+    response_model_by_alias=True,
+)
+def explain_selected_evidence(
+    request: ExplanationRequest,
+    session: Annotated[Session, Depends(get_db)],
+) -> ExplanationRead:
+    try:
+        return ExplanationService(ArtifactRepository(session)).explain(
+            repository_id=_normalize_repository_id(request.repository_id),
+            selected_artifact_id=request.selected_artifact_id,
+            question=request.question,
+            import_warning_codes=list(request.import_warning_codes),
+        )
+    except ExplanationArtifactNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "code": "explanation_artifact_not_found",
+                "message": "Selected evidence artifact was not found",
+            },
+        ) from exc
+    except ExplanationCrossRepositoryError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "explanation_repository_mismatch",
+                "message": "Selected evidence artifact does not belong to this repository",
+            },
+        ) from exc
+    except ExplanationUnsupportedArtifactError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={
+                "code": "unsupported_explanation_artifact",
+                "message": "Selected artifact type cannot be used for explanations",
+            },
+        ) from exc
+    except ExplanationDisconnectedArtifactError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={
+                "code": "disconnected_explanation_artifact",
+                "message": "Selected file has no verified commit relationship",
+            },
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "code": "explanation_generation_failed",
+                "message": "Grounded explanation generation failed",
+            },
+        ) from exc

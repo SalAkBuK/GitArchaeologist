@@ -12,6 +12,8 @@ import {
   GitPullRequest,
   Network,
 } from 'lucide-react'
+import { GroundedExplanationPanel } from '@/components/evidence/grounded-explanation'
+import type { Artifact } from '@/lib/domain'
 import {
   createEvidencePresentation,
   NO_LINKED_PULL_REQUEST_MESSAGE,
@@ -22,8 +24,9 @@ import {
 import type { CommitInvestigation, RepositoryImportWarning } from '@/lib/live-api'
 
 interface EvidenceBrowserProps {
+  apiBaseUrl: string
   investigation: CommitInvestigation
-  availableCommitShas: string[]
+  commits: Artifact[]
   importWarnings: RepositoryImportWarning[]
   onSelectCommit: (commitSha: string) => void
 }
@@ -36,8 +39,9 @@ const STATUS_CLASSES = {
 }
 
 export function EvidenceBrowser({
+  apiBaseUrl,
   investigation,
-  availableCommitShas,
+  commits,
   importWarnings,
   onSelectCommit,
 }: EvidenceBrowserProps) {
@@ -45,10 +49,12 @@ export function EvidenceBrowser({
   const evidence = useMemo(
     () =>
       createEvidencePresentation(investigation, {
-        availableCommitShas,
+        availableCommitShas: commits.flatMap((commit) =>
+          commit.externalId ? [commit.externalId] : [],
+        ),
         importWarnings,
       }),
-    [availableCommitShas, importWarnings, investigation],
+    [commits, importWarnings, investigation],
   )
 
   async function copyFullSha() {
@@ -62,6 +68,14 @@ export function EvidenceBrowser({
 
   return (
     <div className="flex flex-col gap-8">
+      <GroundedExplanationPanel
+        apiBaseUrl={apiBaseUrl}
+        investigation={investigation}
+        commits={commits}
+        importWarnings={importWarnings}
+        onSelectCommit={onSelectCommit}
+      />
+
       <section
         aria-labelledby="selected-commit-heading"
         className="border border-primary/35 bg-card p-5 shadow-xl shadow-black/10"

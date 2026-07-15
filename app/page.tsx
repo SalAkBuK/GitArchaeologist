@@ -287,14 +287,6 @@ export default function Page() {
       repositoryImportResult ? repositoryImportSummary(repositoryImportResult) : null,
     [repositoryImportResult],
   )
-  const availableCommitShas = useMemo(
-    () =>
-      commits.flatMap((commit) =>
-        commit.externalId ? [commit.externalId] : [],
-      ),
-    [commits],
-  )
-
   function handleRepositoryChange(event: ChangeEvent<HTMLInputElement>) {
     repositoryImportController.current?.abort()
     repositoryImportRunner.current?.cancel()
@@ -882,8 +874,9 @@ export default function Page() {
 
             {investigation && (
               <EvidenceBrowser
+                apiBaseUrl={API_BASE_URL}
                 investigation={investigation}
-                availableCommitShas={availableCommitShas}
+                commits={commits}
                 importWarnings={
                   repositoryImportResult?.repositoryId === investigation.repositoryId
                     ? repositoryImportResult.warnings

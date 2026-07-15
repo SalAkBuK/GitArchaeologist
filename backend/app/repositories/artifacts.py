@@ -247,6 +247,32 @@ class ArtifactRepository:
         statement = statement.order_by(ArtifactModel.occurred_at.desc(), ArtifactModel.id.asc())
         return [self._to_read_model(model) for model in self.session.scalars(statement)]
 
+    def get_by_id(self, artifact_id: str) -> ArtifactRead | None:
+        model = self.session.get(ArtifactModel, artifact_id)
+        return self._to_read_model(model) if model else None
+
+    def get_identity(self, artifact_id: str) -> tuple[str, str] | None:
+        identity = self.session.execute(
+            select(ArtifactModel.repository_id, ArtifactModel.source_type).where(
+                ArtifactModel.id == artifact_id
+            )
+        ).one_or_none()
+        return (identity[0], identity[1]) if identity else None
+
+    def get_by_id_for_repository(
+        self,
+        *,
+        repository_id: str,
+        artifact_id: str,
+    ) -> ArtifactRead | None:
+        model = self.session.scalar(
+            select(ArtifactModel).where(
+                ArtifactModel.id == artifact_id,
+                ArtifactModel.repository_id == repository_id,
+            )
+        )
+        return self._to_read_model(model) if model else None
+
     def get_commit(self, *, repository_id: str, commit_sha: str) -> ArtifactRead | None:
         statement = select(ArtifactModel).where(
             ArtifactModel.repository_id == repository_id,

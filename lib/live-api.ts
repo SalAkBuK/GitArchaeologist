@@ -128,6 +128,61 @@ export interface RepositoryImportResult {
   limits: RepositoryImportLimits
 }
 
+export type ExplanationArtifactType =
+  | 'git_commit'
+  | 'github_pull_request'
+  | 'modified_file'
+export type ExplanationConfidence = 'high' | 'medium' | 'low'
+
+export interface CitedExplanationStatement {
+  text: string
+  supportingArtifactIds: string[]
+  supportingEdgeIds: string[]
+}
+
+export interface ExplanationContext {
+  artifactId: string
+  artifactType: ExplanationArtifactType
+  label: string
+}
+
+export interface ExplanationMissingContext {
+  id: string
+  code: string
+  message: string
+  supportingArtifactIds: string[]
+  warningIds: string[]
+  unresolvedReferenceIds: string[]
+}
+
+export interface ExplanationSupportingArtifact {
+  id: string
+  sourceType: ExplanationArtifactType
+  label: string
+}
+
+export interface ExplanationSupportingEdge {
+  id: string
+  relationType: 'contains' | 'modifies'
+  fromArtifactId: string
+  toArtifactId: string
+  sourceLabel: string
+  targetLabel: string
+}
+
+export interface GroundedExplanation {
+  generator: 'deterministic_local'
+  question: string
+  context: ExplanationContext
+  summary: CitedExplanationStatement
+  verifiedFacts: CitedExplanationStatement[]
+  interpretations: CitedExplanationStatement[]
+  missingContext: ExplanationMissingContext[]
+  supportingArtifacts: ExplanationSupportingArtifact[]
+  supportingEdges: ExplanationSupportingEdge[]
+  confidence: ExplanationConfidence
+}
+
 export class ApiResponseError extends Error {
   readonly status: number
   readonly code: string | null
@@ -422,6 +477,112 @@ export function parseCommitInvestigation(value: unknown): CommitInvestigation {
   }
 }
 
+function isExplanationArtifactType(value: unknown): value is ExplanationArtifactType {
+  return (
+    value === 'git_commit' || value === 'github_pull_request' || value === 'modified_file'
+  )
+}
+
+function isCitedExplanationStatement(value: unknown): value is CitedExplanationStatement {
+  return (
+    isRecord(value) &&
+    typeof value.text === 'string' &&
+    value.text.length > 0 &&
+    isStringArray(value.supportingArtifactIds) &&
+    isStringArray(value.supportingEdgeIds) &&
+    (value.supportingArtifactIds.length > 0 || value.supportingEdgeIds.length > 0)
+  )
+}
+
+export function parseGroundedExplanation(value: unknown): GroundedExplanation {
+  if (
+    !isRecord(value) ||
+    value.generator !== 'deterministic_local' ||
+    typeof value.question !== 'string' ||
+    !isRecord(value.context) ||
+    typeof value.context.artifactId !== 'string' ||
+    !isExplanationArtifactType(value.context.artifactType) ||
+    typeof value.context.label !== 'string' ||
+    !isCitedExplanationStatement(value.summary) ||
+    !Array.isArray(value.verifiedFacts) ||
+    !value.verifiedFacts.every(isCitedExplanationStatement) ||
+    !Array.isArray(value.interpretations) ||
+    !value.interpretations.every(isCitedExplanationStatement) ||
+    !Array.isArray(value.missingContext) ||
+    !Array.isArray(value.supportingArtifacts) ||
+    !Array.isArray(value.supportingEdges) ||
+    (value.confidence !== 'high' && value.confidence !== 'medium' && value.confidence !== 'low')
+  ) {
+    throw new Error('Backend returned an invalid grounded explanation')
+  }
+
+  const supportingArtifacts = value.supportingArtifacts
+  if (
+    !supportingArtifacts.every(
+      (item) =>
+        isRecord(item) &&
+        typeof item.id === 'string' &&
+        isExplanationArtifactType(item.sourceType) &&
+        typeof item.label === 'string',
+    )
+  ) {
+    throw new Error('Backend returned invalid explanation artifacts')
+  }
+  const supportingEdges = value.supportingEdges
+  if (
+    !supportingEdges.every(
+      (item) =>
+        isRecord(item) &&
+        typeof item.id === 'string' &&
+        (item.relationType === 'contains' || item.relationType === 'modifies') &&
+        typeof item.fromArtifactId === 'string' &&
+        typeof item.toArtifactId === 'string' &&
+        typeof item.sourceLabel === 'string' &&
+        typeof item.targetLabel === 'string',
+    )
+  ) {
+    throw new Error('Backend returned invalid explanation edges')
+  }
+  if (
+    !value.missingContext.every(
+      (item) =>
+        isRecord(item) &&
+        typeof item.id === 'string' &&
+        typeof item.code === 'string' &&
+        typeof item.message === 'string' &&
+        isStringArray(item.supportingArtifactIds) &&
+        isStringArray(item.warningIds) &&
+        isStringArray(item.unresolvedReferenceIds),
+    )
+  ) {
+    throw new Error('Backend returned invalid explanation missing context')
+  }
+
+  const artifactIds = new Set(supportingArtifacts.map((item) => item.id as string))
+  const edgeIds = new Set(supportingEdges.map((item) => item.id as string))
+  const statements = [value.summary, ...value.verifiedFacts, ...value.interpretations]
+  if (
+    !artifactIds.has(value.context.artifactId) ||
+    supportingEdges.some(
+      (edge) =>
+        !artifactIds.has(edge.fromArtifactId as string) ||
+        !artifactIds.has(edge.toArtifactId as string),
+    ) ||
+    statements.some(
+      (statement) =>
+        statement.supportingArtifactIds.some((id) => !artifactIds.has(id)) ||
+        statement.supportingEdgeIds.some((id) => !edgeIds.has(id)),
+    ) ||
+    value.missingContext.some((item) =>
+      item.supportingArtifactIds.some((id: string) => !artifactIds.has(id)),
+    )
+  ) {
+    throw new Error('Backend returned inconsistent explanation citations')
+  }
+
+  return value as unknown as GroundedExplanation
+}
+
 export function parseIngestionResult(value: unknown): IngestionResult {
   if (!isRecord(value) || typeof value.repositoryId !== 'string' || !value.repositoryId.trim()) {
     throw new Error('Backend returned an invalid ingestion result')
@@ -572,6 +733,87 @@ export async function importPublicRepository(options: {
     throw await apiErrorFromResponse(response)
   }
   return parseRepositoryImportResult(await response.json())
+}
+
+export const MAX_EXPLANATION_QUESTION_LENGTH = 500
+
+export function validateExplanationQuestion(question: string): string | null {
+  const normalized = question.trim()
+  if (!normalized) return 'Enter a question about the selected evidence.'
+  if (normalized.length > MAX_EXPLANATION_QUESTION_LENGTH) {
+    return `Question must be ${MAX_EXPLANATION_QUESTION_LENGTH} characters or fewer.`
+  }
+  return null
+}
+
+export async function requestGroundedExplanation(options: {
+  apiBaseUrl: string
+  repositoryId: string
+  selectedArtifactId: string
+  question: string
+  importWarningCodes: RepositoryImportWarningCode[]
+  signal?: AbortSignal
+  fetchImplementation?: typeof fetch
+}): Promise<GroundedExplanation> {
+  const questionError = validateExplanationQuestion(options.question)
+  if (questionError) throw new Error(questionError)
+  const response = await (options.fetchImplementation ?? fetch)(
+    `${options.apiBaseUrl}/api/explanations`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        repositoryId: options.repositoryId,
+        selectedArtifactId: options.selectedArtifactId,
+        question: options.question.trim(),
+        importWarningCodes: options.importWarningCodes,
+      }),
+      signal: options.signal,
+    },
+  )
+  if (!response.ok) throw await apiErrorFromResponse(response)
+  return parseGroundedExplanation(await response.json())
+}
+
+export interface ExplanationRunner {
+  isActive(): boolean
+  cancel(): void
+  run(
+    task: () => Promise<GroundedExplanation>,
+    onSuccess: (result: GroundedExplanation) => void | Promise<void>,
+  ): Promise<{ started: boolean; result?: GroundedExplanation }>
+}
+
+export function createExplanationRunner(
+  onLoadingChange: (loading: boolean) => void,
+): ExplanationRunner {
+  let active = false
+  let generation = 0
+  return {
+    isActive: () => active,
+    cancel() {
+      generation += 1
+      active = false
+      onLoadingChange(false)
+    },
+    async run(task, onSuccess) {
+      if (active) return { started: false }
+      active = true
+      const requestGeneration = ++generation
+      onLoadingChange(true)
+      try {
+        const result = await task()
+        if (requestGeneration !== generation) return { started: true }
+        await onSuccess(result)
+        return { started: true, result }
+      } finally {
+        if (requestGeneration === generation) {
+          active = false
+          onLoadingChange(false)
+        }
+      }
+    },
+  }
 }
 
 export function validatePullRequestFixtureFile(file: Pick<File, 'name' | 'size'>): void {
